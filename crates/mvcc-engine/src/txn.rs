@@ -454,7 +454,36 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // semantics.
             let _guard = self.db.commit_lock();
 
-            if I::VALIDATES_READS {
+            // A transaction that wrote nothing never needs validating.
+            //
+            // It writes no versions, so it creates no dependency edge out of
+            // itself and cannot be part of a cycle. That much is true of any
+            // scheme. What makes *skipping the check* sound here specifically:
+            //
+            // - every read-write transaction is validated, so each is
+            //   serializable at its own commit timestamp;
+            // - `Oracle::publish` advances the read watermark by a
+            //   min-reduction over in-flight commits, so the watermark never
+            //   passes a commit that is still installing;
+            // - therefore a snapshot `s` is exactly the set of transactions
+            //   with `commit_ts <= s` — a *prefix* of the commit order, and so
+            //   a state some serial execution actually produces.
+            //
+            // Reading a consistent prefix and writing nothing is serializable
+            // by construction, ordered before everything committed after `s`.
+            //
+            // This does not contradict the read-only anomaly of Fekete et al.:
+            // that anomaly needs the two read-write transactions to interleave
+            // non-serializably, which plain snapshot isolation permits and this
+            // validation does not. Removing the validation from read-write
+            // transactions would break the argument.
+            //
+            // Without this, `Serializable` aborts read-only transactions
+            // whenever anything they touched was concurrently updated — see
+            // `tests/hermitage.rs::g1b_*`, which is exactly that shape.
+            let needs_validation = I::VALIDATES_READS && !self.writes.is_empty();
+
+            if needs_validation {
                 let now = self.db.oracle().statement_snapshot();
                 // Conservative OCC validation: abort if anything we read has
                 // changed. More aggressive than SSI's pivot detection, which

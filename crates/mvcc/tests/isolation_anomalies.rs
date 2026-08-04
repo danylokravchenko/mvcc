@@ -204,6 +204,38 @@ fn serializable_read_modify_write_does_not_abort_itself() -> Result<()> {
 }
 
 #[test]
+fn read_only_serializable_transactions_never_abort() -> Result<()> {
+    // A transaction that wrote nothing adds no dependency edge and reads a
+    // prefix of the commit order, so it is serializable by construction. It
+    // must not be aborted just because something it read was concurrently
+    // updated — see the soundness note in `Transaction::commit`.
+    let db = db_with(&[(1, "a", 10), (2, "a", 20)])?;
+    let mut reader = db.begin_with::<Serializable>();
+
+    assert_eq!(reader.get::<Item>(&1)?.unwrap().value, 10);
+    assert_eq!(reader.scan::<Item>()?.len(), 2);
+
+    // Every row the reader touched is overwritten, twice over.
+    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 999).map(|_| ()))?;
+    db.transaction(|tx| tx.update::<Item>(&2, |i| i.value = 888).map(|_| ()))?;
+
+    // Still a stable snapshot, and still commits.
+    assert_eq!(reader.get::<Item>(&1)?.unwrap().value, 10);
+    reader.commit()?;
+
+    // But a transaction that writes even once is validated again.
+    let mut writer = db.begin_with::<Serializable>();
+    assert_eq!(writer.get::<Item>(&1)?.unwrap().value, 999);
+    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 1).map(|_| ()))?;
+    writer.update::<Item>(&2, |i| i.value = 2)?;
+    assert!(
+        writer.commit().is_err(),
+        "a writing transaction is still checked"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_dropped_transaction_rolls_back() -> Result<()> {
     let db = db_with(&[(1, "a", 10)])?;
     {

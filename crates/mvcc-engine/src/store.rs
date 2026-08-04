@@ -46,11 +46,11 @@
 //! torn, so there was never anything for poisoning to protect — the 18 sites it
 //! required were pure noise.
 
+use parking_lot::{Mutex, RwLock};
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use mvcc_core::{
     Error, IndexKey, IsolationLevel, Result, Snapshot as SnapshotLevel, TableId, Timestamp, TxnId,

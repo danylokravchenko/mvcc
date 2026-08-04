@@ -41,8 +41,8 @@
 //! removing them is what `OracleConfig::Batched` and `OracleConfig::Epoch` are
 //! for. `parking_lot` buys roughly 2x; deleting the sets buys the rest.
 
-use std::collections::BTreeSet;
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mvcc_core::{Timestamp, TxnId};

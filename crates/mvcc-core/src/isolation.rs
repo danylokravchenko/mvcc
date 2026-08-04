@@ -283,6 +283,9 @@ mod tests {
 
         assert!(!Snapshot::VALIDATES_READS);
         assert!(!RepeatableRead::VALIDATES_READS);
-        assert!(Serializable::VALIDATES_READS, "this is what stops write skew");
+        assert!(
+            Serializable::VALIDATES_READS,
+            "this is what stops write skew"
+        );
     }
 }

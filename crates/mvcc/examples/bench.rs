@@ -36,7 +36,9 @@ fn main() -> Result<()> {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or_else(|| {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
         });
 
     let db = Arc::new(Database::open(Config::in_memory())?);
