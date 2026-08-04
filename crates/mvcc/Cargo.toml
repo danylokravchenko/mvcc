@@ -1,0 +1,22 @@
+[package]
+name = "mvcc"
+description = "Multi-version concurrency control for ordinary Rust structs. Add #[derive(Mvcc)] and get snapshot-isolated transactions with pluggable isolation levels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["mvcc", "database", "transactions", "concurrency", "isolation"]
+categories = ["database-implementations", "concurrency"]
+
+[features]
+default = ["derive"]
+derive = ["dep:mvcc-macros"]
+
+[dependencies]
+mvcc-core.workspace = true
+mvcc-engine.workspace = true
+mvcc-macros = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = false

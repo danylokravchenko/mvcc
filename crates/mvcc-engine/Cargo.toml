@@ -1,0 +1,12 @@
+[package]
+name = "mvcc-engine"
+description = "The mvcc storage engine: version chains, transactions, timestamp oracle, garbage collection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mvcc-core.workspace = true
+parking_lot = "0.12.5"

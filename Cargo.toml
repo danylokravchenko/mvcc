@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mvcc",
+    "crates/mvcc-core",
+    "crates/mvcc-engine",
+    "crates/mvcc-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danylokravchenko/mvcc"
+authors = ["Danylo Kravchenko <danylo.kravchenko.r@gmail.com>"]
+
+[workspace.dependencies]
+mvcc-core = { path = "crates/mvcc-core", version = "0.1.0" }
+mvcc-engine = { path = "crates/mvcc-engine", version = "0.1.0" }
+mvcc-macros = { path = "crates/mvcc-macros", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

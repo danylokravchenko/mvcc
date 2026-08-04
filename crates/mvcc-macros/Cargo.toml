@@ -1,0 +1,19 @@
+[package]
+name = "mvcc-macros"
+description = "#[derive(Mvcc)] for the mvcc crate. Not intended to be used directly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.3", features = ["full", "extra-traits"] }
+# syn = { version = "2", features = ["full", "extra-traits"] }
+# quote = "1"
+# proc-macro2 = "1"
