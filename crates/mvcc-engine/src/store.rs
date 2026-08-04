@@ -26,10 +26,17 @@
 //! Swapping in lock-free chains and epoch-based reclamation is an internal
 //! change that the public API cannot observe.
 //!
-//! The `Arc` version does hold one real cost worth naming: cloning an `Arc` on
-//! read is an atomic increment on a shared cache line, which is exactly the
-//! "reads must not write to shared memory" rule that `crate::gc` argues for.
-//! That is what the eventual EBR migration buys back.
+//! The `Arc` version holds one real cost, and it is now measured rather than
+//! suspected. Cloning an `Arc` on read is an atomic increment on a shared cache
+//! line, and an `RwLock` read is another — so a single `get` performs several
+//! shared writes before it touches any data. `cargo bench` shows point reads
+//! going from 15.0M ops/sec on one thread to 3.7M on eight; see `DESIGN.md` §6.
+//!
+//! So the "reads take no locks and perform no writes to shared memory" property
+//! this design is built around **is not true yet**. Making it true is the
+//! lock-free chain, EBR and ART-with-OLC work. The three offenders, in the order
+//! worth fixing them: `Database::tables` (one shared refcount, touched on every
+//! operation), `Table::slots`, and `Slot::latest`.
 //!
 //! # Locks
 //!

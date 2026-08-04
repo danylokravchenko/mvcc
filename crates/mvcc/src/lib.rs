@@ -47,7 +47,9 @@
 //!
 //! - Snapshot isolation and serializability behave as documented per level; the
 //!   anomaly suite in `tests/isolation_anomalies.rs` pins this down.
-//! - Readers never block writers and writers never block readers.
+//! - Readers never block on writers, and never abort. (Not yet *lock-free*:
+//!   the current implementation takes short read locks internally, which costs
+//!   scalability but not correctness — see `DESIGN.md` §6.)
 //! - A transaction dropped without `commit()` rolls back.
 //! - Fields may be of any type: nothing is serialised, so a record can hold a
 //!   `HashMap`, an `Instant`, a function pointer — whatever your struct holds.

@@ -1,65 +1,75 @@
 //! The timestamp oracle — and the single most important scalability decision in
 //! the engine.
 //!
-//! Every transaction takes a timestamp at begin and another at commit. The
-//! obvious implementation is one global `AtomicU64::fetch_add`. That is also the
-//! thing that will cap this engine's throughput long before the disk does: a
-//! contended cache line must be acquired exclusively by each core, and the cost
-//! *grows* with core count rather than staying flat.
+//! Every transaction takes a snapshot at begin and a timestamp at commit, and
+//! both used to run through a global mutex. Measurement put those two mutexes at
+//! roughly a third of the write path's cost at 8 threads; removing them
+//! entirely, as a throwaway experiment, moved write throughput from 1.23M to
+//! 1.79M ops/sec. Neither uses a lock now.
 //!
-//! [`OracleConfig`] documents the escape routes. Only `Centralised` is
-//! implemented so far — see the build order in `DESIGN.md`.
+//! # The read watermark, without a mutex
 //!
-//! # Why `parking_lot` here
+//! The watermark is the largest `T` such that every commit at or below `T` has
+//! finished installing its versions. Readers use it rather than the raw counter,
+//! because the counter can name a commit whose versions are still being stamped
+//! — a reader at that timestamp would see a torn commit.
 //!
-//! The two `Mutex<BTreeSet<u64>>` below are the hottest contended locks in the
-//! engine: every transaction touches `active` twice (begin and release) and
-//! every commit touches `installing` twice. Their critical sections are tiny —
-//! one `u64` insert or remove into a small `BTreeSet`, on the order of tens of
-//! nanoseconds.
-//!
-//! That is precisely the shape where `std::sync::Mutex` does badly. It parks a
-//! contended waiter in the kernel almost immediately, and a kernel round trip
-//! costs far more than the critical section it is waiting on. `parking_lot`
-//! spins briefly before parking, so a waiter usually acquires the lock without
-//! ever descending into the kernel.
-//!
-//! Measured with `cargo bench`, 8 threads (medians of 5):
+//! Computing it used to mean a `BTreeSet` of in-flight timestamps under a mutex,
+//! walked on every commit. It is really a sequence-completion problem, so it is
+//! now a ring of atomics (the LMAX Disruptor sequencer pattern):
 //!
 //! ```text
-//!                                    std      parking_lot
-//!   point reads (100 per txn)      3.08M/s      3.19M/s     +4%
-//!   read-only txns (1 read each)   1.77M/s      3.47M/s    +96%
-//!   write txns                     0.87M/s      1.36M/s    +56%
+//!   completed[ts % RING] = ts        once `ts` has finished installing
+//!   watermark            advances    while completed[watermark + 1] == watermark + 1
 //! ```
 //!
-//! The point-read row is the control: it amortises the oracle over 100 reads,
-//! so it barely moves. Nearly all of the win is these two mutexes.
+//! An in-flight commit leaves a hole and the watermark stops there — exactly the
+//! old semantics, with no lock and no allocation.
 //!
-//! **This is a mitigation, not a fix.** Making a contended lock cheaper is not
-//! the same as not contending. Both sets are per-transaction global state, and
-//! removing them is what `OracleConfig::Batched` and `OracleConfig::Epoch` are
-//! for. `parking_lot` buys roughly 2x; deleting the sets buys the rest.
+//! This needs commit timestamps to be **gap-free**, which is why transaction ids
+//! now come from their own counter. The two can no longer be told apart by
+//! value, and do not need to be: the tag bit in `mvcc_core::time` is what
+//! distinguishes an in-flight writer from a commit timestamp.
+//!
+//! # The GC watermark, sharded
+//!
+//! Live snapshots still need a min-reduction, but nothing needs it to be exact
+//! at every instant — it gates version reclamation, which is a background
+//! concern. It is sharded by transaction id, so registering and releasing touch
+//! one shard's lock instead of a single global one, and the min is taken across
+//! shards only when someone asks.
 
-use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
+
 use mvcc_core::{Timestamp, TxnId};
+
+/// Slots in the completion ring. A commit only stalls if it runs this far ahead
+/// of the watermark, which takes this many commits installing at once.
+const RING: usize = 4096;
+const RING_MASK: u64 = RING as u64 - 1;
+
+/// Independent shards for the live-snapshot set. More than the core count buys
+/// nothing; fewer leaves contention on the table.
+const ACTIVE_SHARDS: usize = 16;
 
 /// How timestamps are handed out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OracleConfig {
-    /// One global atomic counter.
+    /// One global atomic counter for commit timestamps.
     ///
-    /// Simple, exact, and totally ordered. Correct at any core count and the
-    /// right default up to roughly a socket's worth of cores.
+    /// Exact and totally ordered. The counter is still a contended cache line —
+    /// see `Batched` and `Epoch` for the ways out — but it is now a bare
+    /// `fetch_add` with no lock behind it.
     #[default]
     Centralised,
 
     /// Each thread claims a block of `stride` timestamps with one `fetch_add`
     /// and hands them out locally. Cuts coherence traffic by `stride`, at the
-    /// cost of timestamps no longer being densely allocated in commit order.
+    /// cost of timestamps no longer being densely allocated — which the
+    /// completion ring currently relies on, so this needs a different watermark.
     ///
     /// Not yet implemented.
     Batched { stride: u64 },
@@ -75,37 +85,47 @@ pub enum OracleConfig {
     Epoch { epoch_micros: u64 },
 }
 
-/// Hands out begin and commit timestamps and maintains the two watermarks.
+#[repr(align(64))] // one shard per cache line
+struct ActiveShard {
+    /// Snapshot to the number of transactions holding it.
+    ///
+    /// A multiset, not a set: transactions that begin before any commit lands
+    /// all share a snapshot value, and a plain set would let the first of them
+    /// to finish deregister the others.
+    snapshots: Mutex<BTreeMap<u64, usize>>,
+}
+
+/// Hands out transaction ids and commit timestamps, and maintains the two
+/// watermarks.
 pub struct Oracle {
     config: OracleConfig,
-    /// Source of both transaction ids and commit timestamps, so the two can
-    /// never collide in a version's tagged `begin` field.
-    next: AtomicU64,
+    /// Commit timestamps. Gap-free, because the completion ring depends on it.
+    next_ts: AtomicU64,
+    /// Transaction ids. A separate sequence, so ids do not punch holes in the
+    /// commit timestamps.
+    next_id: AtomicU64,
     /// Highest timestamp below which every commit is fully installed.
     read_watermark: AtomicU64,
-    /// Commit timestamps allocated but not yet fully installed.
-    installing: Mutex<BTreeSet<u64>>,
-    /// Snapshots of live transactions, for the GC watermark.
-    ///
-    /// A multiset — snapshot to the number of transactions holding it — not a
-    /// set. Transactions that begin before any commit lands all share the same
-    /// snapshot value, so a plain `BTreeSet` would let the first of them to
-    /// finish deregister the others. The watermark would then advance past
-    /// snapshots that are still live, and versions those transactions can still
-    /// reach would become eligible for reclamation.
-    active: Mutex<BTreeMap<u64, usize>>,
+    /// `completed[ts & RING_MASK] == ts` once `ts` has finished installing.
+    completed: Box<[AtomicU64]>,
+    active: Box<[ActiveShard]>,
 }
 
 impl Oracle {
     pub fn new(config: OracleConfig) -> Self {
         Oracle {
             config,
-            // Start at 1: timestamp 0 means "before everything", and is used as
-            // the `begin` of bootstrap data.
-            next: AtomicU64::new(1),
+            // Start at 1: timestamp 0 means "before everything", and is the
+            // watermark's initial value.
+            next_ts: AtomicU64::new(1),
+            next_id: AtomicU64::new(1),
             read_watermark: AtomicU64::new(0),
-            installing: Mutex::new(BTreeSet::new()),
-            active: Mutex::new(BTreeMap::new()),
+            completed: (0..RING).map(|_| AtomicU64::new(0)).collect(),
+            active: (0..ACTIVE_SHARDS)
+                .map(|_| ActiveShard {
+                    snapshots: Mutex::new(BTreeMap::new()),
+                })
+                .collect(),
         }
     }
 
@@ -113,43 +133,43 @@ impl Oracle {
         self.config
     }
 
-    /// Restart the counter above `ts`, after recovery has replayed the log.
-    ///
-    /// Must not reuse a timestamp: a recovered transaction sharing a timestamp
-    /// with a new one would be invisible to a snapshot taken between them.
+    /// Restart the counters above `ts`.
     pub fn resume_after(&self, ts: Timestamp) {
-        let next = ts.raw() + 1;
-        self.next.store(next, Ordering::Release);
+        self.next_ts.store(ts.raw() + 1, Ordering::Release);
         self.read_watermark.store(ts.raw(), Ordering::Release);
     }
 
     /// Allocate a transaction id.
+    ///
+    /// Ids and commit timestamps come from different counters and may coincide
+    /// numerically. That is safe: a version's `begin` field is tagged (see
+    /// `mvcc_core::time`), and the tag — not the value — says whether it holds
+    /// an in-flight writer or a commit timestamp.
     pub fn next_txn_id(&self) -> TxnId {
-        TxnId(self.next.fetch_add(1, Ordering::Relaxed))
+        TxnId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Take a snapshot for a beginning transaction, and register it as active.
+    /// Take a snapshot for a beginning transaction and register it as live.
     ///
-    /// Returns the *read watermark*, not the raw counter. Using the counter
-    /// would let a transaction see a commit timestamp whose versions are still
-    /// being stamped, and so observe a torn commit.
-    pub fn begin_snapshot(&self) -> Timestamp {
-        let mut active = self.active.lock();
+    /// Returns the *read watermark*, not the raw counter, so a transaction
+    /// cannot see a commit whose versions are still being stamped.
+    pub fn begin_snapshot(&self, id: TxnId) -> Timestamp {
         let ts = Timestamp(self.read_watermark.load(Ordering::Acquire));
-        *active.entry(ts.raw()).or_insert(0) += 1;
+        *self.shard(id).snapshots.lock().entry(ts.raw()).or_insert(0) += 1;
         ts
     }
 
-    /// A snapshot for a statement in a `ReadCommitted` transaction. Does not
-    /// register — the transaction's begin snapshot already pins the watermark.
+    /// A snapshot for a statement in a `ReadCommitted` transaction, and for
+    /// commit-time revalidation. Registers nothing: the caller's begin snapshot
+    /// already pins the watermark.
     pub fn statement_snapshot(&self) -> Timestamp {
         Timestamp(self.read_watermark.load(Ordering::Acquire))
     }
 
     /// Drop a transaction's registration when it commits or aborts.
-    pub fn release_snapshot(&self, ts: Timestamp) {
-        let mut active = self.active.lock();
-        if let std::collections::btree_map::Entry::Occupied(mut e) = active.entry(ts.raw()) {
+    pub fn release_snapshot(&self, id: TxnId, ts: Timestamp) {
+        let mut shard = self.shard(id).snapshots.lock();
+        if let std::collections::btree_map::Entry::Occupied(mut e) = shard.entry(ts.raw()) {
             *e.get_mut() -= 1;
             if *e.get() == 0 {
                 e.remove();
@@ -157,34 +177,47 @@ impl Oracle {
         }
     }
 
-    /// Allocate a commit timestamp and mark it as installing.
+    /// Allocate a commit timestamp.
     ///
-    /// Must be paired with [`Oracle::publish`], or the read watermark stops
-    /// advancing and every later snapshot is frozen.
+    /// Must be paired with [`Oracle::publish`], or the read watermark stops at
+    /// this timestamp and every later snapshot freezes.
     pub fn begin_commit(&self) -> Timestamp {
-        let mut installing = self.installing.lock();
-        let ts = Timestamp(self.next.fetch_add(1, Ordering::Relaxed));
-        installing.insert(ts.raw());
-        ts
+        let ts = self.next_ts.fetch_add(1, Ordering::Relaxed);
+
+        // The ring can only describe `RING` timestamps at once, so running
+        // further ahead than that would overwrite a slot the watermark has not
+        // reached. It takes `RING` commits installing simultaneously, so in
+        // practice this never spins.
+        while ts.saturating_sub(self.read_watermark.load(Ordering::Acquire)) >= RING as u64 {
+            std::hint::spin_loop();
+        }
+        Timestamp(ts)
     }
 
-    /// Publish that `ts` is fully installed and advance the read watermark.
-    ///
-    /// The watermark can only pass a timestamp once every *lower* commit has
-    /// also finished installing, so this is a min-reduction over the in-flight
-    /// set rather than a plain store. Committing out of order is therefore
-    /// safe: an early finisher does not expose a later-numbered commit.
+    /// Publish that `ts` is fully installed, and advance the read watermark over
+    /// whatever contiguous run of completed commits that exposes.
     pub fn publish(&self, ts: Timestamp) {
-        let mut installing = self.installing.lock();
-        installing.remove(&ts.raw());
+        self.completed[(ts.raw() & RING_MASK) as usize].store(ts.raw(), Ordering::Release);
 
-        // Everything below the lowest still-installing commit is settled. With
-        // nothing installing, everything allocated so far is settled.
-        let settled = match installing.first() {
-            Some(&lowest) => lowest - 1,
-            None => self.next.load(Ordering::Relaxed) - 1,
-        };
-        self.read_watermark.fetch_max(settled, Ordering::Release);
+        // Several threads may run this at once. The CAS decides which of them
+        // moves the watermark; a loser re-reads and continues. The watermark
+        // only ever moves forward and only over completed slots, so no commit
+        // can be skipped and none can be exposed twice.
+        loop {
+            let current = self.read_watermark.load(Ordering::Acquire);
+            let candidate = current + 1;
+            if self.completed[(candidate & RING_MASK) as usize].load(Ordering::Acquire) != candidate
+            {
+                return; // a hole: some earlier commit is still installing
+            }
+            if self
+                .read_watermark
+                .compare_exchange_weak(current, candidate, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
+        }
     }
 
     /// The oldest snapshot any live transaction can still see. Versions whose
@@ -193,16 +226,27 @@ impl Oracle {
     /// A single long-running reader pins this and stalls all reclamation — the
     /// classic MVCC failure mode. See [`crate::gc`].
     pub fn gc_watermark(&self) -> Timestamp {
-        let active = self.active.lock();
-        match active.first_key_value() {
-            Some((&oldest, _)) => Timestamp(oldest),
+        let oldest = self
+            .active
+            .iter()
+            .filter_map(|s| s.snapshots.lock().keys().next().copied())
+            .min();
+        match oldest {
+            Some(ts) => Timestamp(ts),
             None => Timestamp(self.read_watermark.load(Ordering::Acquire)),
         }
     }
 
     /// Number of live transactions, for [`crate::gc::GcStats`].
     pub fn active_count(&self) -> usize {
-        self.active.lock().values().sum()
+        self.active
+            .iter()
+            .map(|s| s.snapshots.lock().values().sum::<usize>())
+            .sum()
+    }
+
+    fn shard(&self, id: TxnId) -> &ActiveShard {
+        &self.active[(id.0 as usize) % ACTIVE_SHARDS]
     }
 }
 
@@ -233,23 +277,33 @@ mod tests {
     }
 
     #[test]
+    fn watermark_crosses_a_long_run_in_one_go() {
+        let o = Oracle::new(OracleConfig::Centralised);
+        let stamps: Vec<_> = (0..100).map(|_| o.begin_commit()).collect();
+        // Published in reverse, so only the very last call can move anything.
+        for ts in stamps.iter().rev() {
+            o.publish(*ts);
+        }
+        assert_eq!(o.statement_snapshot(), *stamps.last().unwrap());
+    }
+
+    #[test]
     fn gc_watermark_is_pinned_by_the_oldest_reader() {
         let o = Oracle::new(OracleConfig::Centralised);
         let ts = o.begin_commit();
         o.publish(ts);
 
-        let old_reader = o.begin_snapshot();
+        let old = o.next_txn_id();
+        let old_reader = o.begin_snapshot(old);
         let commit = o.begin_commit();
         o.publish(commit);
-        let _new_reader = o.begin_snapshot();
+        let new = o.next_txn_id();
+        let _new_reader = o.begin_snapshot(new);
 
         assert_eq!(o.gc_watermark(), old_reader, "the oldest reader pins GC");
 
-        o.release_snapshot(old_reader);
-        assert!(
-            o.gc_watermark() > old_reader,
-            "releasing it lets GC advance"
-        );
+        o.release_snapshot(old, old_reader);
+        assert!(o.gc_watermark() > old_reader, "releasing it lets GC advance");
     }
 
     #[test]
@@ -258,29 +312,58 @@ mod tests {
         // gets the same snapshot value. Tracking them in a set rather than a
         // multiset let the first to finish deregister the rest, which advanced
         // the GC watermark past snapshots that were still live.
+        //
+        // The two ids are chosen to land in the *same* shard, so this exercises
+        // the collision rather than accidentally testing two shards.
         let o = Oracle::new(OracleConfig::Centralised);
-        let a = o.begin_snapshot();
-        let b = o.begin_snapshot();
-        assert_eq!(a, b, "both began before anything committed");
+        let a = TxnId(1);
+        let b = TxnId(1 + ACTIVE_SHARDS as u64);
+        let sa = o.begin_snapshot(a);
+        let sb = o.begin_snapshot(b);
+        assert_eq!(sa, sb, "both began before anything committed");
         assert_eq!(o.active_count(), 2);
 
         let ts = o.begin_commit();
         o.publish(ts);
 
-        o.release_snapshot(a);
+        o.release_snapshot(a, sa);
         assert_eq!(o.active_count(), 1, "b is still running");
-        assert_eq!(o.gc_watermark(), b, "b's snapshot must still pin GC");
+        assert_eq!(o.gc_watermark(), sb, "b's snapshot must still pin GC");
 
-        o.release_snapshot(b);
+        o.release_snapshot(b, sb);
         assert_eq!(o.active_count(), 0);
-        assert!(o.gc_watermark() > b, "now GC may advance");
+        assert!(o.gc_watermark() > sb, "now GC may advance");
     }
 
     #[test]
-    fn txn_ids_and_timestamps_never_collide() {
-        let o = Oracle::new(OracleConfig::Centralised);
-        let id = o.next_txn_id();
-        let ts = o.begin_commit();
-        assert_ne!(id.0, ts.raw());
+    fn concurrent_commits_leave_the_watermark_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let o = Arc::new(Oracle::new(OracleConfig::Centralised));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let o = Arc::clone(&o);
+                thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        let ts = o.begin_commit();
+                        o.publish(ts);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker panicked");
+        }
+
+        // Every timestamp handed out was published, so the watermark must have
+        // caught all the way up. A stall here would mean the CAS loop dropped a
+        // completed slot.
+        let next = o.next_ts.load(Ordering::Acquire);
+        assert_eq!(
+            o.statement_snapshot(),
+            Timestamp(next - 1),
+            "watermark stalled below a fully published sequence"
+        );
     }
 }

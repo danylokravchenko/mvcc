@@ -229,7 +229,7 @@ pub struct Transaction<'db, I: IsolationLevel> {
 impl<'db, I: IsolationLevel> Transaction<'db, I> {
     pub(crate) fn new(db: &'db Database) -> Self {
         let id = db.oracle().next_txn_id();
-        let snapshot = db.oracle().begin_snapshot();
+        let snapshot = db.oracle().begin_snapshot(id);
         Transaction {
             id,
             snapshot,
@@ -315,8 +315,12 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
     /// Install a new version of `key`'s record, or fail if the slot is
     /// contended or was committed under us.
-    fn write<T: Versioned>(&mut self, key: &T::Key, value: Option<T>) -> Result<()> {
-        let table = self.db.table::<T>()?;
+    fn write<T: Versioned>(
+        &mut self,
+        table: &Arc<Table<T>>,
+        key: &T::Key,
+        value: Option<T>,
+    ) -> Result<()> {
         let slot = table.slot_or_create(key);
 
         // First-updater-wins, part one: whoever takes the lock owns the slot
@@ -398,7 +402,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        self.write(&key, Some(value))
+        self.write(&table, &key, Some(value))
     }
 
     /// Read-modify-write by primary key. Returns `false` if the record does not
@@ -442,7 +446,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        self.write(key, Some(next))?;
+        self.write(&table, key, Some(next))?;
         Ok(true)
     }
 
@@ -466,7 +470,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return Ok(false);
         }
 
-        self.write::<T>(key, None)?;
+        self.write::<T>(&table, key, None)?;
         Ok(true)
     }
 
@@ -620,11 +624,22 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         Ok(matched.into_iter().map(|(_, version)| Ref { version }).collect())
     }
 
-    /// The SSI pivot test: abort only when this transaction has an
-    /// rw-antidependency edge in *both* directions.
+    /// Find this transaction's rw-antidependency edges and record them on the
+    /// shared [`TxnState`]s involved.
     ///
-    /// Returns `true` if the transaction may commit. Runs under the commit
-    /// lock, so the two halves see a consistent world.
+    /// Returns `false` if the transaction must abort. **Runs without any global
+    /// lock**, which is what keeps the expensive half of commit — predicate
+    /// re-scans especially — off the serialized path.
+    ///
+    /// Three things make that safe:
+    ///
+    /// - Revalidation reads at a *fixed* `now`, so it is a snapshot read and
+    ///   cannot tear no matter what commits alongside it.
+    /// - The decision variable is a pair of atomic flags, not the scan result,
+    ///   and **both parties to an edge set both flags**. An edge that forms
+    ///   after this scan is still recorded, by the other side.
+    /// - The final [`TxnState::is_pivot`] check happens later, under the commit
+    ///   lock, and flags only ever go false → true.
     ///
     /// The predecessor to this was "abort if anything I read changed", i.e. the
     /// outgoing edge alone. That is sound but aborts transactions that are in
@@ -632,7 +647,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// but whose own writes nobody read, can always be ordered before that
     /// someone. Requiring both edges is Cahill's rule and is still sufficient:
     /// every cycle contains a transaction with two consecutive rw edges.
-    fn serializable_check_passes(&self) -> bool {
+    fn detect_conflicts(&self) -> bool {
         if self.state.is_aborted() {
             return false;
         }
@@ -665,7 +680,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         if self.state.is_pivot() {
             return false;
         }
-        if self.out_conflict_present() {
+        if self.state.has_out_conflict() {
             for write in &self.writes {
                 for reader in write.conflicting_readers(self.id, gc) {
                     reader.set_out_conflict();
@@ -677,11 +692,6 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         !self.state.is_pivot()
     }
 
-    fn out_conflict_present(&self) -> bool {
-        // `is_pivot` needs both; this asks for the outgoing half alone.
-        self.state.has_out_conflict()
-    }
-
     /// Commit.
     ///
     /// Consumes the transaction, so use-after-commit is a compile error rather
@@ -689,45 +699,59 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     pub fn commit(mut self) -> Result<()> {
         self.ensure_live()?;
 
+        // A transaction that wrote nothing never needs validating.
+        //
+        // It writes no versions, so it creates no dependency edge out of itself
+        // and cannot be part of a cycle. That much is true of any scheme. What
+        // makes *skipping the check* sound here specifically:
+        //
+        // - every read-write transaction is validated, so each is serializable
+        //   at its own commit timestamp;
+        // - `Oracle::publish` advances the read watermark by a min-reduction
+        //   over in-flight commits, so the watermark never passes a commit that
+        //   is still installing;
+        // - therefore a snapshot `s` is exactly the set of transactions with
+        //   `commit_ts <= s` — a *prefix* of the commit order, and so a state
+        //   some serial execution actually produces.
+        //
+        // Reading a consistent prefix and writing nothing is serializable by
+        // construction, ordered before everything committed after `s`.
+        //
+        // This does not contradict the read-only anomaly of Fekete et al.: that
+        // anomaly needs the two read-write transactions to interleave
+        // non-serializably, which plain snapshot isolation permits and this
+        // validation does not.
+        let needs_validation = I::VALIDATES_READS && !self.writes.is_empty();
+
+        // Conflict detection runs *outside* the critical section. See
+        // `detect_conflicts` for why that is safe.
+        if needs_validation && !self.detect_conflicts() {
+            self.rollback();
+            return Err(Error::SerializationFailure);
+        }
+
         {
-            // One global critical section covering validation, timestamp
-            // allocation and stamping. Correct but not scalable: this is the
-            // next thing to shard, and the reason the oracle already handles
-            // out-of-order installs — removing this lock must not change the
-            // semantics.
-            let _guard = self.db.commit_lock();
+            // Only `Serializable` needs global coordination, and only for the
+            // decision itself.
+            //
+            // Everything else in this block is already safe without it:
+            // `begin_commit` is one atomic increment; each version is stamped in
+            // a slot this transaction holds exclusively via first-updater-wins;
+            // and the read watermark does not advance past `ts` until `publish`,
+            // so no reader can observe a half-stamped commit. That last property
+            // is the whole job of the watermark, and it is what lets the weaker
+            // levels commit with no global lock at all.
+            //
+            // What the lock still buys `Serializable`: two transactions that
+            // are pivots for *each other* must not both pass their own
+            // `is_pivot` check and commit. Serializing the decision-and-stamp
+            // step means whichever goes second sees the first's flags.
+            let _decision = needs_validation.then(|| self.db.commit_lock());
 
-            // A transaction that wrote nothing never needs validating.
-            //
-            // It writes no versions, so it creates no dependency edge out of
-            // itself and cannot be part of a cycle. That much is true of any
-            // scheme. What makes *skipping the check* sound here specifically:
-            //
-            // - every read-write transaction is validated, so each is
-            //   serializable at its own commit timestamp;
-            // - `Oracle::publish` advances the read watermark by a
-            //   min-reduction over in-flight commits, so the watermark never
-            //   passes a commit that is still installing;
-            // - therefore a snapshot `s` is exactly the set of transactions
-            //   with `commit_ts <= s` — a *prefix* of the commit order, and so
-            //   a state some serial execution actually produces.
-            //
-            // Reading a consistent prefix and writing nothing is serializable
-            // by construction, ordered before everything committed after `s`.
-            //
-            // This does not contradict the read-only anomaly of Fekete et al.:
-            // that anomaly needs the two read-write transactions to interleave
-            // non-serializably, which plain snapshot isolation permits and this
-            // validation does not. Removing the validation from read-write
-            // transactions would break the argument.
-            //
-            // Without this, `Serializable` aborts read-only transactions
-            // whenever anything they touched was concurrently updated — see
-            // `tests/hermitage.rs::g1b_*`, which is exactly that shape.
-            let needs_validation = I::VALIDATES_READS && !self.writes.is_empty();
-
-            if needs_validation && !self.serializable_check_passes() {
-                drop(_guard);
+            // Re-read under the lock. Flags only go false → true, so an edge
+            // recorded since `detect_conflicts` ran is caught here.
+            if needs_validation && self.state.is_pivot() {
+                drop(_decision);
                 self.rollback();
                 return Err(Error::SerializationFailure);
             }
@@ -736,16 +760,11 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             for write in &self.writes {
                 write.commit(ts);
             }
-            // Publish while still holding the lock, so that the next
-            // transaction to validate its read set is guaranteed to see this
-            // commit. The oracle's min-reduction handles out-of-order publishes
-            // correctly on its own; this is belt-and-braces for as long as the
-            // global lock exists, and the two must stay consistent when it goes.
             self.db.oracle().publish(ts);
             self.state.mark_committed(ts);
-        };
+        }
 
-        self.db.oracle().release_snapshot(self.snapshot);
+        self.db.oracle().release_snapshot(self.id, self.snapshot);
         self.done = true;
         Ok(())
     }
@@ -769,7 +788,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         // Frees this transaction's SIREAD locks: an aborted transaction's reads
         // never constrained anyone. See `TxnState::is_expired`.
         self.state.mark_aborted();
-        self.db.oracle().release_snapshot(self.snapshot);
+        self.db.oracle().release_snapshot(self.id, self.snapshot);
         self.done = true;
     }
 }
