@@ -806,15 +806,25 @@ fn scan_then_filter_is_sound_but_far_more_likely_to_abort() -> Result<()> {
     let mut t2 = db.begin_with::<Serializable>();
 
     // The filter never reaches the engine; both see "the whole table".
-    let _ = t1.scan::<Test>()?.iter().filter(|r| r.value % 3 == 0).count();
-    let _ = t2.scan::<Test>()?.iter().filter(|r| r.value % 3 == 0).count();
+    let _ = t1
+        .scan::<Test>()?
+        .iter()
+        .filter(|r| r.value % 3 == 0)
+        .count();
+    let _ = t2
+        .scan::<Test>()?
+        .iter()
+        .filter(|r| r.value % 3 == 0)
+        .count();
 
     // Inserts that match nobody's predicate.
     t1.insert(Test { id: 3, value: 31 })?;
     t2.insert(Test { id: 4, value: 32 })?;
 
     t1.commit()?;
-    let err = t2.commit().expect_err("the whole-table read set is invalidated");
+    let err = t2
+        .commit()
+        .expect_err("the whole-table read set is invalidated");
     assert!(matches!(err, Error::SerializationFailure), "{err}");
     Ok(())
 }

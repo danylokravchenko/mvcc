@@ -18,6 +18,19 @@
 //! that is what localised the `parking_lot` win to the oracle (see
 //! `mvcc_engine::oracle`) rather than to the version-chain locks.
 //!
+//! # Choosing a thread count
+//!
+//! The default is `available_parallelism`, which on a hybrid CPU counts
+//! efficiency cores too. On an Apple M1 that is 8, of which only 4 are
+//! performance cores — so the 4 → 8 step measures cores getting slower, not
+//! contention getting worse, and reads appear to stop scaling when they have
+//! not. Pass the performance-core count explicitly when comparing runs:
+//!
+//! ```text
+//! sysctl -n hw.perflevel0.logicalcpu    # macOS: performance cores
+//! cargo bench -- 4
+//! ```
+//!
 //! # Why `harness = false`, and no criterion
 //!
 //! Criterion is built for single-threaded latency micro-benchmarks: it calls a
@@ -70,7 +83,7 @@ fn main() -> Result<()> {
     })?;
 
     println!("{threads} threads, {ROWS} rows, {SAMPLES} samples of {RUN:?} per workload\n");
-    println!("  {:<28} {:>14}   {}", "workload", "median ops/s", "range");
+    println!("  {:<28} {:>14}   range", "workload", "median ops/s");
 
     let reads = sample(threads, &db, |db, rng| {
         let mut tx = db.begin_with::<Snapshot>();
@@ -103,7 +116,8 @@ fn main() -> Result<()> {
         let key = rng() % ROWS;
         db.transaction_with::<Serializable, _, _>(|tx| {
             let current = tx.get::<Row>(&key)?.map(|r| r.value).unwrap_or(0);
-            tx.update::<Row>(&key, |r| r.value = current + 1).map(|_| ())
+            tx.update::<Row>(&key, |r| r.value = current + 1)
+                .map(|_| ())
         })
         .expect("update");
         1
@@ -200,7 +214,7 @@ fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

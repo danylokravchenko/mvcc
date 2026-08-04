@@ -144,6 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_levels_differ_only_in_their_declared_constants() {
         // The engine branches on these, so they are the whole behavioural
         // difference between the levels. Asserting them here means a typo in a

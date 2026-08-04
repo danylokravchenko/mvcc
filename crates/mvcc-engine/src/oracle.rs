@@ -303,7 +303,10 @@ mod tests {
         assert_eq!(o.gc_watermark(), old_reader, "the oldest reader pins GC");
 
         o.release_snapshot(old, old_reader);
-        assert!(o.gc_watermark() > old_reader, "releasing it lets GC advance");
+        assert!(
+            o.gc_watermark() > old_reader,
+            "releasing it lets GC advance"
+        );
     }
 
     #[test]

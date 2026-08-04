@@ -167,15 +167,15 @@ impl Readers {
     /// Every live reader other than `writer`.
     pub fn others(&mut self, writer: TxnId, gc_watermark: Timestamp) -> Vec<Arc<TxnState>> {
         self.0.retain(|r| !r.is_expired(gc_watermark));
-        self.0
-            .iter()
-            .filter(|r| r.id != writer)
-            .cloned()
-            .collect()
+        self.0.iter().filter(|r| r.id != writer).cloned().collect()
     }
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -203,7 +203,10 @@ mod tests {
         assert!(!t.is_expired(Timestamp(100)), "still running");
 
         t.mark_committed(Timestamp(50));
-        assert!(!t.is_expired(Timestamp(49)), "a live snapshot still predates it");
+        assert!(
+            !t.is_expired(Timestamp(49)),
+            "a live snapshot still predates it"
+        );
         assert!(t.is_expired(Timestamp(50)));
         assert!(t.is_expired(Timestamp(51)));
     }
@@ -220,13 +223,17 @@ mod tests {
         let mut readers = Readers::default();
         let a = state(1);
         let b = state(2);
+        assert!(readers.is_empty(), "no readers initially");
         readers.register(&a);
         readers.register(&a);
         readers.register(&b);
         assert_eq!(readers.len(), 2, "duplicate registration");
 
-        assert!(readers.has_other_reader(TxnId(1), Timestamp(0)), "b reads it");
-        assert!(!readers.has_other_reader(TxnId(3), Timestamp(0)) == false);
+        assert!(
+            readers.has_other_reader(TxnId(1), Timestamp(0)),
+            "b reads it"
+        );
+        assert!(readers.has_other_reader(TxnId(3), Timestamp(0)));
 
         // With b expired, only the writer's own read remains.
         b.mark_aborted();

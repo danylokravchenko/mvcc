@@ -1,5 +1,6 @@
 //! The transaction handle — the type users actually touch.
 
+use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use crate::store::{Database, Slot, Table, Version};
 /// A write this transaction has installed but not yet committed.
 ///
 /// Type-erased so one `Transaction` can hold writes to many different tables.
-trait WriteOp: Send + Sync {
+trait WriteOp<'db>: Send + Sync {
     /// Stamp the new version visible at `ts` and retire the one it replaced.
     fn commit(&self, ts: Timestamp);
     /// Unlink the new version, restoring the slot to what it was.
@@ -30,8 +31,8 @@ trait WriteOp: Send + Sync {
     fn conflicting_readers(&self, txn: TxnId, gc: Timestamp) -> Vec<Arc<TxnState>>;
 }
 
-struct SlotWrite<T: Versioned> {
-    table: Arc<Table<T>>,
+struct SlotWrite<'db, T: Versioned> {
+    table: &'db Table<T>,
     slot: Arc<Slot<T>>,
     installed: Arc<Version<T>>,
     /// The version `installed` displaced, whose `end` must be stamped on commit
@@ -40,7 +41,7 @@ struct SlotWrite<T: Versioned> {
     txn: TxnId,
 }
 
-impl<T: Versioned> WriteOp for SlotWrite<T> {
+impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
     fn commit(&self, ts: Timestamp) {
         // Order matters. The new version becomes visible only once `begin`
         // holds a real timestamp, so stamping the old version's `end` first
@@ -82,7 +83,7 @@ impl<T: Versioned> WriteOp for SlotWrite<T> {
 /// fully installed. That is what satisfies Cahill's "the transaction on the
 /// outgoing edge commits first" condition without tracking commit order
 /// separately.
-trait ReadValidation: Send + Sync {
+trait ReadValidation<'db>: Send + Sync {
     fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>>;
 }
 
@@ -91,7 +92,7 @@ struct SlotRead<T> {
     observed: Option<Arc<Version<T>>>,
 }
 
-impl<T: Send + Sync> ReadValidation for SlotRead<T> {
+impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<T> {
     fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
         // Read as nobody, so this transaction's own in-flight writes stay
         // invisible. Validating as ourselves would compare what we read against
@@ -120,16 +121,16 @@ impl<T: Send + Sync> ReadValidation for SlotRead<T> {
 /// Validation compares both the set of matching keys and the identity of each
 /// matching version, so one entry covers phantoms (a key appears or disappears)
 /// and item changes (a key's version was replaced) together.
-struct PredicateRead<T: Versioned> {
-    table: Arc<Table<T>>,
+struct PredicateRead<'db, T: Versioned> {
+    table: &'db Table<T>,
     predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
     observed: Vec<(T::Key, Arc<Version<T>>)>,
 }
 
-impl<T: Versioned> ReadValidation for PredicateRead<T> {
+impl<'db, T: Versioned> ReadValidation<'db> for PredicateRead<'db, T> {
     fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
         let current = self.table.matching(now, TxnId::NONE, &*self.predicate);
-        writers_of_change(&self.table, &self.observed, &current, now)
+        writers_of_change(self.table, &self.observed, &current, now)
     }
 }
 
@@ -137,15 +138,15 @@ impl<T: Versioned> ReadValidation for PredicateRead<T> {
 ///
 /// The range *is* the predicate, so revalidation re-runs the range scan rather
 /// than a full table scan — the same reason the index exists in the first place.
-struct IndexRangeRead<T: Versioned> {
-    table: Arc<Table<T>>,
+struct IndexRangeRead<'db, T: Versioned> {
+    table: &'db Table<T>,
     position: usize,
     lo: Bound<IndexKey>,
     hi: Bound<IndexKey>,
     observed: Vec<(T::Key, Arc<Version<T>>)>,
 }
 
-impl<T: Versioned> ReadValidation for IndexRangeRead<T> {
+impl<'db, T: Versioned> ReadValidation<'db> for IndexRangeRead<'db, T> {
     fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
         let current = self.table.matching_in_index(
             self.position,
@@ -154,7 +155,7 @@ impl<T: Versioned> ReadValidation for IndexRangeRead<T> {
             now,
             TxnId::NONE,
         );
-        writers_of_change(&self.table, &self.observed, &current, now)
+        writers_of_change(self.table, &self.observed, &current, now)
     }
 }
 
@@ -216,9 +217,19 @@ pub struct Transaction<'db, I: IsolationLevel> {
     /// Outlives the `Transaction`: SIREAD locks and version records keep
     /// referring to it after commit. See [`crate::ssi`].
     state: Arc<TxnState>,
-    writes: Vec<Box<dyn WriteOp>>,
+    writes: Vec<Box<dyn WriteOp<'db> + 'db>>,
     /// Empty, and never pushed to, unless `I::VALIDATES_READS`.
-    reads: Vec<Box<dyn ReadValidation>>,
+    reads: Vec<Box<dyn ReadValidation<'db> + 'db>>,
+    /// Tables already resolved by this transaction.
+    ///
+    /// The registry lock is uncontended in isolation but it is a *single*
+    /// `RwLock` taken on every operation, so at eight threads it is a cache line
+    /// ping-ponging between cores. A transaction touches one or two tables, so a
+    /// linear scan over this beats going back to the registry every time.
+    ///
+    /// A `&'db dyn Any` rather than a raw pointer, so the transaction stays
+    /// `Send` and no further `unsafe` is needed here.
+    table_cache: Vec<(TypeId, &'db (dyn Any + Send + Sync))>,
     done: bool,
     /// `I` appears in no field: every difference between the levels is a
     /// `const` on [`IsolationLevel`], so the type parameter exists purely to
@@ -237,6 +248,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             db,
             writes: Vec::new(),
             reads: Vec::new(),
+            table_cache: Vec::new(),
             done: false,
             _level: PhantomData,
         }
@@ -264,6 +276,22 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         }
     }
 
+    /// Resolve `T`'s table, caching the registry lookup for the rest of this
+    /// transaction. See [`Transaction::table_cache`].
+    fn table<T: Versioned>(&mut self) -> Result<&'db Table<T>> {
+        let type_id = TypeId::of::<T>();
+        if let Some((_, erased)) = self.table_cache.iter().find(|(id, _)| *id == type_id) {
+            return Ok(erased
+                .downcast_ref::<Table<T>>()
+                .expect("cache is keyed by TypeId"));
+        }
+        let erased = self.db.table_erased(type_id, T::TABLE_NAME)?;
+        self.table_cache.push((type_id, erased));
+        Ok(erased
+            .downcast_ref::<Table<T>>()
+            .expect("registry is keyed by TypeId"))
+    }
+
     fn ensure_live(&self) -> Result<()> {
         if self.done {
             Err(Error::Aborted)
@@ -278,7 +306,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// no locks and never block, whatever else is happening to the record.
     pub fn get<T: Versioned>(&mut self, key: &T::Key) -> Result<Option<Ref<T>>> {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
         let Some(slot) = table.slot(key) else {
@@ -317,7 +345,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// contended or was committed under us.
     fn write<T: Versioned>(
         &mut self,
-        table: &Arc<Table<T>>,
+        table: &'db Table<T>,
         key: &T::Key,
         value: Option<T>,
     ) -> Result<()> {
@@ -365,7 +393,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         *slot.latest.write() = Some(installed.clone());
 
         self.writes.push(Box::new(SlotWrite {
-            table: table.clone(),
+            table,
             slot,
             installed,
             replaced,
@@ -380,7 +408,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// visible, non-deleted version, or if a unique index would be violated.
     pub fn insert<T: Versioned>(&mut self, value: T) -> Result<()> {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let key = value.key();
         let snapshot = self.statement_snapshot();
 
@@ -402,7 +430,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        self.write(&table, &key, Some(value))
+        self.write(table, &key, Some(value))
     }
 
     /// Read-modify-write by primary key. Returns `false` if the record does not
@@ -414,7 +442,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// conflict, because `Drop` has nowhere to return an error to.
     pub fn update<T: Versioned>(&mut self, key: &T::Key, f: impl FnOnce(&mut T)) -> Result<bool> {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
         let Some(slot) = table.slot(key) else {
@@ -446,7 +474,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        self.write(&table, key, Some(next))?;
+        self.write(table, key, Some(next))?;
         Ok(true)
     }
 
@@ -457,7 +485,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// at older snapshots still see the record alive.
     pub fn delete<T: Versioned>(&mut self, key: &T::Key) -> Result<bool> {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
         let Some(slot) = table.slot(key) else {
@@ -470,7 +498,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return Ok(false);
         }
 
-        self.write::<T>(&table, key, None)?;
+        self.write::<T>(table, key, None)?;
         Ok(true)
     }
 
@@ -515,7 +543,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         P: Fn(&T) -> bool + Send + Sync + 'static,
     {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
         let predicate: Arc<dyn Fn(&T) -> bool + Send + Sync> = Arc::new(predicate);
@@ -537,7 +565,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // to register on. This is what makes phantoms detectable.
             table.register_predicate(&self.state, Arc::clone(&predicate));
             self.reads.push(Box::new(PredicateRead {
-                table: table.clone(),
+                table,
                 predicate,
                 observed,
             }));
@@ -564,7 +592,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         R: RangeBounds<K>,
     {
         self.ensure_live()?;
-        let table = self.db.table::<T>()?;
+        let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
         let position = table
@@ -582,8 +610,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let lo = encode_bound(range.start_bound());
         let hi = encode_bound(range.end_bound());
 
-        let matched =
-            table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id);
+        let matched = table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id);
 
         if I::VALIDATES_READS {
             let observed =
@@ -613,7 +640,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             );
 
             self.reads.push(Box::new(IndexRangeRead {
-                table: table.clone(),
+                table,
                 position,
                 lo,
                 hi,
@@ -621,7 +648,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             }));
         }
 
-        Ok(matched.into_iter().map(|(_, version)| Ref { version }).collect())
+        Ok(matched
+            .into_iter()
+            .map(|(_, version)| Ref { version })
+            .collect())
     }
 
     /// Find this transaction's rw-antidependency edges and record them on the

@@ -151,9 +151,20 @@ impl<T> Slot<T> {
 }
 
 /// A registered table: the primary map plus any secondary indexes.
+/// Independent shards of a table's primary map.
+///
+/// One `RwLock` over the whole map is a single cache line that every core
+/// touches on every key lookup, which is one of the three things `DESIGN.md` §6
+/// identifies as stopping reads from scaling. Sharding by key hash spreads that
+/// across `SLOT_SHARDS` lines.
+const SLOT_SHARDS: usize = 64;
+
+type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>>>;
+
 pub struct Table<T: Versioned> {
     id: TableId,
-    slots: RwLock<HashMap<T::Key, Arc<Slot<T>>>>,
+    /// Primary key to slot, sharded by key hash. See [`SLOT_SHARDS`].
+    slots: Box<[SlotShard<T>]>,
     /// One per `#[mvcc(index)]` field, in declaration order.
     ///
     /// Entries are *candidates*, not answers: an index maps a key to primary
@@ -183,7 +194,9 @@ impl<T: Versioned> Table<T> {
     fn new(id: TableId) -> Self {
         Table {
             id,
-            slots: RwLock::new(HashMap::new()),
+            slots: (0..SLOT_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
             secondary: T::indexes()
                 .iter()
                 .map(|_| RwLock::new(BTreeMap::new()))
@@ -196,8 +209,15 @@ impl<T: Versioned> Table<T> {
         self.id
     }
 
+    fn shard(&self, key: &T::Key) -> &RwLock<HashMap<T::Key, Arc<Slot<T>>>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.slots[(hasher.finish() as usize) % SLOT_SHARDS]
+    }
+
     pub(crate) fn slot(&self, key: &T::Key) -> Option<Arc<Slot<T>>> {
-        self.slots.read().get(key).cloned()
+        self.shard(key).read().get(key).cloned()
     }
 
     /// Fetch the slot for `key`, creating an empty one if absent.
@@ -205,8 +225,8 @@ impl<T: Versioned> Table<T> {
         if let Some(s) = self.slot(key) {
             return s;
         }
-        let mut slots = self.slots.write();
-        slots
+        self.shard(key)
+            .write()
             .entry(key.clone())
             .or_insert_with(|| Arc::new(Slot::new()))
             .clone()
@@ -244,8 +264,11 @@ impl<T: Versioned> Table<T> {
 
     /// Every primary key, for a full scan.
     pub(crate) fn all_keys(&self) -> Vec<T::Key> {
-        let slots = self.slots.read();
-        let mut keys: Vec<_> = slots.keys().cloned().collect();
+        let mut keys: Vec<_> = self
+            .slots
+            .iter()
+            .flat_map(|shard| shard.read().keys().cloned().collect::<Vec<_>>())
+            .collect();
         keys.sort();
         keys
     }
@@ -265,7 +288,9 @@ impl<T: Versioned> Table<T> {
     ) -> Vec<(T::Key, Arc<Version<T>>)> {
         let mut out = Vec::new();
         for key in self.all_keys() {
-            let Some(slot) = self.slot(&key) else { continue };
+            let Some(slot) = self.slot(&key) else {
+                continue;
+            };
             let Some(version) = slot.read(snapshot, reader) else {
                 continue;
             };
@@ -310,7 +335,9 @@ impl<T: Versioned> Table<T> {
         // rolled-back writes.
         let mut out: Vec<(IndexKey, T::Key, Arc<Version<T>>)> = Vec::new();
         for key in self.index_candidates(position, lo.clone(), hi.clone()) {
-            let Some(slot) = self.slot(&key) else { continue };
+            let Some(slot) = self.slot(&key) else {
+                continue;
+            };
             let Some(version) = slot.read(snapshot, reader) else {
                 continue;
             };
@@ -436,6 +463,8 @@ impl Config {
 /// The handle everything hangs off.
 pub struct Database {
     oracle: Oracle,
+    /// Type-erased tables. **Append-only** — see the safety note on
+    /// [`Database::table`], which depends on entries never being removed.
     tables: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
     next_table_id: AtomicU16,
     /// Serialises the validate-allocate-stamp phase of commit.
@@ -494,14 +523,36 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn table<T: Versioned>(&self) -> Result<Arc<Table<T>>> {
+    /// Borrow a registered table for as long as the `Database` is borrowed.
+    ///
+    /// Type-erased, because the only caller — `Transaction::table` — caches the
+    /// result without naming `T`. Returning a reference rather than an `Arc`
+    /// matters more than it looks: this is on *every* operation, and cloning the
+    /// `Arc` meant an atomic increment and decrement on one refcount shared by
+    /// every core in the process. See `DESIGN.md` §6.
+    pub(crate) fn table_erased(
+        &self,
+        type_id: TypeId,
+        name: &'static str,
+    ) -> Result<&(dyn Any + Send + Sync)> {
         let tables = self.tables.read();
-        tables
-            .get(&TypeId::of::<T>())
-            .and_then(|t| t.clone().downcast::<Table<T>>().ok())
-            .ok_or(Error::TableNotRegistered {
-                table: T::TABLE_NAME,
-            })
+        let entry = tables
+            .get(&type_id)
+            .ok_or(Error::TableNotRegistered { table: name })?;
+        let erased: &(dyn Any + Send + Sync) = &**entry;
+
+        // SAFETY: the borrow is extended from the read guard to `&self`.
+        //
+        // Sound because the registry is *append-only*: `register` inserts and
+        // never removes or replaces an entry, and there is no public API that
+        // does either. The `Arc` holding this `Table` is therefore owned by
+        // `self` for all of `self`'s life, and the `Table` itself lives on the
+        // heap and never moves. Dropping the guard releases the lock but cannot
+        // drop or relocate the referent.
+        //
+        // If a `deregister` is ever added, this becomes unsound and must go
+        // back to returning an `Arc`.
+        Ok(unsafe { &*(erased as *const (dyn Any + Send + Sync)) })
     }
 
     /// Begin a transaction at the default isolation level (snapshot isolation).
