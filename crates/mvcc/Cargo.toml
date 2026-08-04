@@ -18,5 +18,11 @@ mvcc-core.workspace = true
 mvcc-engine.workspace = true
 mvcc-macros = { workspace = true, optional = true }
 
+# `harness = false`: this is a multi-threaded throughput benchmark with its own
+# `fn main()`, not a libtest/criterion micro-benchmark. See the file's docs.
+[[bench]]
+name = "throughput"
+harness = false
+
 [package.metadata.docs.rs]
 all-features = false

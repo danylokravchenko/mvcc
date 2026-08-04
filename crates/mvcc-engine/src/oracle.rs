@@ -24,7 +24,7 @@
 //! spins briefly before parking, so a waiter usually acquires the lock without
 //! ever descending into the kernel.
 //!
-//! Measured on `examples/bench.rs`, 8 threads (medians of 3):
+//! Measured with `cargo bench`, 8 threads (medians of 5):
 //!
 //! ```text
 //!                                    std      parking_lot
