@@ -33,7 +33,7 @@ trait WriteOp<'db>: Send + Sync {
 
 struct SlotWrite<'db, T: Versioned> {
     table: &'db Table<T>,
-    slot: Arc<Slot<T>>,
+    slot: &'db Slot<T>,
     installed: Arc<Version<T>>,
     /// The version `installed` displaced, whose `end` must be stamped on commit
     /// and which the slot is restored to on abort.
@@ -54,7 +54,7 @@ impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
     }
 
     fn abort(&self) {
-        *self.slot.latest.write() = self.replaced.clone();
+        self.slot.latest.store(self.replaced.clone());
         self.slot.unlock(self.txn);
     }
 
@@ -84,16 +84,48 @@ impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
 /// outgoing edge commits first" condition without tracking commit order
 /// separately.
 trait ReadValidation<'db>: Send + Sync {
-    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>>;
+    fn revalidate(&self, now: Timestamp) -> Revalidation;
 }
 
-struct SlotRead<T> {
-    slot: Arc<Slot<T>>,
+/// The outcome of re-checking one read at commit.
+///
+/// `changed` and `writers` are separate on purpose. A writer below
+/// `Serializable` has no [`TxnState`] — it does no SSI bookkeeping of its own,
+/// and allocating one per transaction for nobody to read cost an allocation on
+/// the hot path — so its versions are anonymous. The change it made still has to
+/// set *this* transaction's outgoing edge.
+///
+/// Collapsing the two, and treating "no writers named" as "nothing changed",
+/// silently drops that edge: a `Serializable` transaction whose read was
+/// overwritten by a `Snapshot` one would see a clean read set and commit. It is
+/// a quiet failure, and `both_edges_together_abort` is the test that catches it.
+#[derive(Default)]
+struct Revalidation {
+    changed: bool,
+    /// Writers that can be marked. May be empty even when `changed` is true.
+    writers: Vec<Arc<TxnState>>,
+}
+
+impl Revalidation {
+    fn unchanged() -> Self {
+        Revalidation::default()
+    }
+
+    fn changed_by(writers: Vec<Arc<TxnState>>) -> Self {
+        Revalidation {
+            changed: true,
+            writers,
+        }
+    }
+}
+
+struct SlotRead<'db, T> {
+    slot: &'db Slot<T>,
     observed: Option<Arc<Version<T>>>,
 }
 
-impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<T> {
-    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
+impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<'db, T> {
+    fn revalidate(&self, now: Timestamp) -> Revalidation {
         // Read as nobody, so this transaction's own in-flight writes stay
         // invisible. Validating as ourselves would compare what we read against
         // what we then wrote, and every read-modify-write would abort itself.
@@ -104,9 +136,9 @@ impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<T> {
             _ => false,
         };
         if unchanged {
-            Vec::new()
+            Revalidation::unchanged()
         } else {
-            current.and_then(|v| v.writer.clone()).into_iter().collect()
+            Revalidation::changed_by(current.and_then(|v| v.writer.clone()).into_iter().collect())
         }
     }
 }
@@ -128,7 +160,7 @@ struct PredicateRead<'db, T: Versioned> {
 }
 
 impl<'db, T: Versioned> ReadValidation<'db> for PredicateRead<'db, T> {
-    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
+    fn revalidate(&self, now: Timestamp) -> Revalidation {
         let current = self.table.matching(now, TxnId::NONE, &*self.predicate);
         writers_of_change(self.table, &self.observed, &current, now)
     }
@@ -147,7 +179,7 @@ struct IndexRangeRead<'db, T: Versioned> {
 }
 
 impl<'db, T: Versioned> ReadValidation<'db> for IndexRangeRead<'db, T> {
-    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
+    fn revalidate(&self, now: Timestamp) -> Revalidation {
         let current = self.table.matching_in_index(
             self.position,
             self.lo.clone(),
@@ -178,7 +210,16 @@ fn writers_of_change<T: Versioned>(
     observed: &[(T::Key, Arc<Version<T>>)],
     current: &[(T::Key, Arc<Version<T>>)],
     now: Timestamp,
-) -> Vec<Arc<TxnState>> {
+) -> Revalidation {
+    let identical = observed.len() == current.len()
+        && observed
+            .iter()
+            .zip(current)
+            .all(|((ko, vo), (kc, vc))| ko == kc && Arc::ptr_eq(vo, vc));
+    if identical {
+        return Revalidation::unchanged();
+    }
+
     let mut writers = Vec::new();
 
     for (key, version) in current {
@@ -201,7 +242,7 @@ fn writers_of_change<T: Versioned>(
         }
     }
 
-    writers
+    Revalidation::changed_by(writers)
 }
 
 /// A transaction at isolation level `I`.
@@ -216,7 +257,11 @@ pub struct Transaction<'db, I: IsolationLevel> {
     /// Shared with other transactions, which set this one's conflict flags.
     /// Outlives the `Transaction`: SIREAD locks and version records keep
     /// referring to it after commit. See [`crate::ssi`].
-    state: Arc<TxnState>,
+    ///
+    /// `None` below `Serializable`. Only SSI reads these flags, so allocating
+    /// one per transaction at every level meant a `malloc` and `free` on the
+    /// hot path for a value nobody would look at.
+    state: Option<Arc<TxnState>>,
     writes: Vec<Box<dyn WriteOp<'db> + 'db>>,
     /// Empty, and never pushed to, unless `I::VALIDATES_READS`.
     reads: Vec<Box<dyn ReadValidation<'db> + 'db>>,
@@ -244,7 +289,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         Transaction {
             id,
             snapshot,
-            state: TxnState::new(id, snapshot),
+            state: I::VALIDATES_READS.then(|| TxnState::new(id, snapshot)),
             db,
             writes: Vec::new(),
             reads: Vec::new(),
@@ -274,6 +319,19 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         } else {
             self.snapshot
         }
+    }
+
+    /// This transaction's SSI state.
+    ///
+    /// # Panics
+    ///
+    /// Below `Serializable`, where it is never allocated. Every caller is
+    /// already inside a `I::VALIDATES_READS` branch, which the compiler folds
+    /// away for the other levels.
+    fn ssi(&self) -> &Arc<TxnState> {
+        self.state
+            .as_ref()
+            .expect("SSI state is only touched when I::VALIDATES_READS")
     }
 
     /// Resolve `T`'s table, caching the registry lookup for the rest of this
@@ -314,7 +372,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // on "this key does not exist" must abort if someone creates it.
             if I::VALIDATES_READS {
                 let slot = table.slot_or_create(key);
-                slot.readers.lock().register(&self.state);
+                slot.readers.lock().register(self.ssi());
                 self.reads.push(Box::new(SlotRead::<T> {
                     slot,
                     observed: None,
@@ -327,9 +385,9 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
         if I::VALIDATES_READS {
             // SIREAD lock: a later writer of this slot needs to know we read it.
-            slot.readers.lock().register(&self.state);
+            slot.readers.lock().register(self.ssi());
             self.reads.push(Box::new(SlotRead::<T> {
-                slot: slot.clone(),
+                slot,
                 observed: version.clone(),
             }));
         }
@@ -359,7 +417,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        let replaced = slot.latest.read().clone();
+        let replaced = slot.latest.load_full();
 
         // First-updater-wins, part two: someone may have committed and released
         // the lock between our snapshot and now. Writing on top of that version
@@ -387,10 +445,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             end: std::sync::atomic::AtomicU64::new(Timestamp::MAX.raw()),
             prev: replaced.clone(),
             value,
-            writer: Some(Arc::clone(&self.state)),
+            writer: self.state.clone(),
         });
 
-        *slot.latest.write() = Some(installed.clone());
+        slot.latest.store(Some(installed.clone()));
 
         self.writes.push(Box::new(SlotWrite {
             table,
@@ -563,7 +621,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // Predicate SIREAD lock: a later insert has to be checked against
             // this predicate, since a row that does not exist yet has no slot
             // to register on. This is what makes phantoms detectable.
-            table.register_predicate(&self.state, Arc::clone(&predicate));
+            table.register_predicate(self.ssi(), Arc::clone(&predicate));
             self.reads.push(Box::new(PredicateRead {
                 table,
                 predicate,
@@ -622,7 +680,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             let extract = T::indexes()[position].extract;
             let (plo, phi) = (lo.clone(), hi.clone());
             table.register_predicate(
-                &self.state,
+                self.ssi(),
                 Arc::new(move |record: &T| {
                     let k = extract(record);
                     let lo_ok = match &plo {
@@ -678,7 +736,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// someone. Requiring both edges is Cahill's rule and is still sufficient:
     /// every cycle contains a transaction with two consecutive rw edges.
     fn detect_conflicts(&self) -> bool {
-        if self.state.is_aborted() {
+        if self.ssi().is_aborted() {
             return false;
         }
 
@@ -687,8 +745,13 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
         // --- outgoing edges: did anything I read change under me? -----------
         for read in &self.reads {
-            for writer in read.conflicting_writers(now) {
-                self.state.set_out_conflict();
+            let outcome = read.revalidate(now);
+            if !outcome.changed {
+                continue;
+            }
+            self.ssi().set_out_conflict();
+
+            for writer in outcome.writers {
                 // The other side of the same edge. It may already have
                 // committed, in which case marking it is how a *later*
                 // transaction learns the structure exists.
@@ -707,19 +770,19 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         // --- incoming edges: did anyone read what I overwrote? --------------
         // Only worth asking if we have an outgoing edge, since a pivot needs
         // both and this half is the expensive one.
-        if self.state.is_pivot() {
+        if self.ssi().is_pivot() {
             return false;
         }
-        if self.state.has_out_conflict() {
+        if self.ssi().has_out_conflict() {
             for write in &self.writes {
                 for reader in write.conflicting_readers(self.id, gc) {
                     reader.set_out_conflict();
-                    self.state.set_in_conflict();
+                    self.ssi().set_in_conflict();
                 }
             }
         }
 
-        !self.state.is_pivot()
+        !self.ssi().is_pivot()
     }
 
     /// Commit.
@@ -780,7 +843,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
             // Re-read under the lock. Flags only go false → true, so an edge
             // recorded since `detect_conflicts` ran is caught here.
-            if needs_validation && self.state.is_pivot() {
+            if needs_validation && self.ssi().is_pivot() {
                 drop(_decision);
                 self.rollback();
                 return Err(Error::SerializationFailure);
@@ -791,7 +854,9 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
                 write.commit(ts);
             }
             self.db.oracle().publish(ts);
-            self.state.mark_committed(ts);
+            if let Some(state) = &self.state {
+                state.mark_committed(ts);
+            }
         }
 
         self.db.oracle().release_snapshot(self.id, self.snapshot);
@@ -817,7 +882,9 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         }
         // Frees this transaction's SIREAD locks: an aborted transaction's reads
         // never constrained anyone. See `TxnState::is_expired`.
-        self.state.mark_aborted();
+        if let Some(state) = &self.state {
+            state.mark_aborted();
+        }
         self.db.oracle().release_snapshot(self.id, self.snapshot);
         self.done = true;
     }

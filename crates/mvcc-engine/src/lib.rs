@@ -1,6 +1,7 @@
 //! The storage engine.
 
 pub mod gc;
+mod hash;
 pub mod index;
 pub mod oracle;
 pub mod ssi;

@@ -39,7 +39,6 @@
 //! one shard's lock instead of a single global one, and the min is taken across
 //! shards only when someone asks.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
@@ -51,9 +50,36 @@ use mvcc_core::{Timestamp, TxnId};
 const RING: usize = 4096;
 const RING_MASK: u64 = RING as u64 - 1;
 
-/// Independent shards for the live-snapshot set. More than the core count buys
-/// nothing; fewer leaves contention on the table.
-const ACTIVE_SHARDS: usize = 16;
+/// Independent shards for the live-snapshot set and the transaction-id counter.
+/// More than the core count buys nothing; fewer leaves contention on the table.
+///
+/// The two use the same number deliberately. Ids are handed out as
+/// `1 + slot + SHARDS * n`, so `id % SHARDS` recovers the thread's slot — which
+/// means a thread's transactions always land in *its own* snapshot shard, and
+/// the two structures contend as one instead of interleaving randomly.
+const SHARDS: usize = 16;
+
+/// A stable per-thread index into the sharded counters.
+///
+/// One atomic increment per thread for the lifetime of the process, then a
+/// thread-local read. Deliberately process-global rather than per-`Database`:
+/// it is only a hint for which shard to prefer, and every `Database` has its own
+/// counters, so sharing it across them cannot produce a duplicate id.
+fn thread_slot() -> usize {
+    use std::cell::Cell;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static SLOT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    SLOT.with(|slot| match slot.get() {
+        Some(s) => s,
+        None => {
+            let s = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) % SHARDS;
+            slot.set(Some(s));
+            s
+        }
+    })
+}
 
 /// How timestamps are handed out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,14 +111,27 @@ pub enum OracleConfig {
     Epoch { epoch_micros: u64 },
 }
 
+#[repr(align(64))] // one counter per cache line
+struct IdShard {
+    next: AtomicU64,
+}
+
 #[repr(align(64))] // one shard per cache line
 struct ActiveShard {
-    /// Snapshot to the number of transactions holding it.
+    /// Snapshots of the transactions live in this shard.
     ///
-    /// A multiset, not a set: transactions that begin before any commit lands
-    /// all share a snapshot value, and a plain set would let the first of them
-    /// to finish deregister the others.
-    snapshots: Mutex<BTreeMap<u64, usize>>,
+    /// A flat `Vec`, and a multiset: duplicates are separate entries, because
+    /// transactions that begin before any commit lands all share a snapshot
+    /// value and one finishing must not deregister the others.
+    ///
+    /// Ordered structures are the obvious choice for "give me the minimum" and
+    /// the wrong one here. A shard holds a handful of live transactions, so a
+    /// `BTreeMap` spent a tree descent and sometimes a node allocation on every
+    /// begin and every release — measurable per-transaction cost — to make a
+    /// scan over three elements marginally cheaper. Push, `swap_remove`, and a
+    /// linear minimum beat it comfortably at this size, and the `Vec` keeps its
+    /// capacity so the steady state does not allocate at all.
+    snapshots: Mutex<Vec<u64>>,
 }
 
 /// Hands out transaction ids and commit timestamps, and maintains the two
@@ -101,9 +140,14 @@ pub struct Oracle {
     config: OracleConfig,
     /// Commit timestamps. Gap-free, because the completion ring depends on it.
     next_ts: AtomicU64,
-    /// Transaction ids. A separate sequence, so ids do not punch holes in the
-    /// commit timestamps.
-    next_id: AtomicU64,
+    /// Transaction ids, one counter per shard.
+    ///
+    /// Unlike commit timestamps these need only be *unique*, not dense — the
+    /// completion ring does not track them — which is what makes sharding them
+    /// legal. A single global `fetch_add` here was the last per-transaction
+    /// shared write, and it was enough on its own to make read-only
+    /// transactions scale negatively.
+    next_id: Box<[IdShard]>,
     /// Highest timestamp below which every commit is fully installed.
     read_watermark: AtomicU64,
     /// `completed[ts & RING_MASK] == ts` once `ts` has finished installing.
@@ -118,12 +162,16 @@ impl Oracle {
             // Start at 1: timestamp 0 means "before everything", and is the
             // watermark's initial value.
             next_ts: AtomicU64::new(1),
-            next_id: AtomicU64::new(1),
+            next_id: (0..SHARDS)
+                .map(|_| IdShard {
+                    next: AtomicU64::new(0),
+                })
+                .collect(),
             read_watermark: AtomicU64::new(0),
             completed: (0..RING).map(|_| AtomicU64::new(0)).collect(),
-            active: (0..ACTIVE_SHARDS)
+            active: (0..SHARDS)
                 .map(|_| ActiveShard {
-                    snapshots: Mutex::new(BTreeMap::new()),
+                    snapshots: Mutex::new(Vec::new()),
                 })
                 .collect(),
         }
@@ -146,7 +194,12 @@ impl Oracle {
     /// `mvcc_core::time`), and the tag — not the value — says whether it holds
     /// an in-flight writer or a commit timestamp.
     pub fn next_txn_id(&self) -> TxnId {
-        TxnId(self.next_id.fetch_add(1, Ordering::Relaxed))
+        let slot = thread_slot();
+        let n = self.next_id[slot].next.fetch_add(1, Ordering::Relaxed);
+        // `1 +` because 0 is `TxnId::NONE`, and because `Slot::lock` uses 0 to
+        // mean "free". Striding by `SHARDS` keeps ids from different shards
+        // distinct without any coordination between them.
+        TxnId(1 + slot as u64 + SHARDS as u64 * n)
     }
 
     /// Take a snapshot for a beginning transaction and register it as live.
@@ -155,7 +208,7 @@ impl Oracle {
     /// cannot see a commit whose versions are still being stamped.
     pub fn begin_snapshot(&self, id: TxnId) -> Timestamp {
         let ts = Timestamp(self.read_watermark.load(Ordering::Acquire));
-        *self.shard(id).snapshots.lock().entry(ts.raw()).or_insert(0) += 1;
+        self.shard(id).snapshots.lock().push(ts.raw());
         ts
     }
 
@@ -169,11 +222,10 @@ impl Oracle {
     /// Drop a transaction's registration when it commits or aborts.
     pub fn release_snapshot(&self, id: TxnId, ts: Timestamp) {
         let mut shard = self.shard(id).snapshots.lock();
-        if let std::collections::btree_map::Entry::Occupied(mut e) = shard.entry(ts.raw()) {
-            *e.get_mut() -= 1;
-            if *e.get() == 0 {
-                e.remove();
-            }
+        // Removes one entry, not every equal one — several live transactions
+        // may share this snapshot value.
+        if let Some(at) = shard.iter().position(|&s| s == ts.raw()) {
+            shard.swap_remove(at);
         }
     }
 
@@ -229,7 +281,7 @@ impl Oracle {
         let oldest = self
             .active
             .iter()
-            .filter_map(|s| s.snapshots.lock().keys().next().copied())
+            .filter_map(|s| s.snapshots.lock().iter().copied().min())
             .min();
         match oldest {
             Some(ts) => Timestamp(ts),
@@ -239,14 +291,16 @@ impl Oracle {
 
     /// Number of live transactions, for [`crate::gc::GcStats`].
     pub fn active_count(&self) -> usize {
-        self.active
-            .iter()
-            .map(|s| s.snapshots.lock().values().sum::<usize>())
-            .sum()
+        self.active.iter().map(|s| s.snapshots.lock().len()).sum()
     }
 
+    /// The snapshot shard for `id`.
+    ///
+    /// Ids are `1 + slot + SHARDS * n`, so this recovers the allocating
+    /// thread's slot and every transaction of a given thread lands in the same
+    /// shard as its siblings and no one else's.
     fn shard(&self, id: TxnId) -> &ActiveShard {
-        &self.active[(id.0 as usize) % ACTIVE_SHARDS]
+        &self.active[(id.0 as usize) % SHARDS]
     }
 }
 
@@ -320,7 +374,7 @@ mod tests {
         // the collision rather than accidentally testing two shards.
         let o = Oracle::new(OracleConfig::Centralised);
         let a = TxnId(1);
-        let b = TxnId(1 + ACTIVE_SHARDS as u64);
+        let b = TxnId(1 + SHARDS as u64);
         let sa = o.begin_snapshot(a);
         let sb = o.begin_snapshot(b);
         assert_eq!(sa, sb, "both began before anything committed");

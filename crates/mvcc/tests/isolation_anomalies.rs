@@ -283,6 +283,11 @@ fn both_edges_together_abort() -> Result<()> {
     assert_eq!(t.get::<Item>(&1)?.unwrap().value, 10);
 
     // T's outgoing edge: row 1 is overwritten under it.
+    //
+    // Note the overwriting transaction runs at *snapshot* isolation, so it has
+    // no SSI state and its version names no writer. T must still notice the
+    // change — "nobody to blame" is not "nothing happened". This is the case
+    // that broke when SSI state stopped being allocated below `Serializable`.
     db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 999).map(|_| ()))?;
 
     t.update::<Item>(&2, |i| i.value = 2)?;

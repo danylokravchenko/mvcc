@@ -65,6 +65,9 @@ use mvcc_core::{
     Versioned, Visibility,
 };
 
+use arc_swap::ArcSwapOption;
+
+use crate::hash::FxBuildHasher;
 use crate::oracle::{Oracle, OracleConfig};
 use crate::ssi::{Readers, TxnState};
 use crate::txn::Transaction;
@@ -101,7 +104,30 @@ impl<T> Version<T> {
 /// survive every update.
 #[repr(align(64))] // own cache line: `lock` is contended
 pub struct Slot<T> {
-    pub(crate) latest: RwLock<Option<Arc<Version<T>>>>,
+    /// Head of the version chain.
+    ///
+    /// An `ArcSwapOption` rather than an `RwLock`, so a reader never takes a
+    /// lock to find the current version. Writes are already serialised by
+    /// `lock` below — first-updater-wins means only one transaction can be
+    /// installing here — so the only thing the lock was providing was making the
+    /// `Arc` load atomic against a concurrent store, which is exactly what
+    /// `ArcSwap` does without one.
+    ///
+    /// This is a real trade, not a free win, and `cargo bench` measures both
+    /// halves of it. Reading four rows from every thread (ops/sec):
+    ///
+    /// ```text
+    ///                 1 thread    4 threads
+    ///   RwLock          76.3M       25.2M     collapses under contention
+    ///   ArcSwapOption   56.6M       42.1M
+    /// ```
+    ///
+    /// Uncontended, the `RwLock` wins — `ArcSwap`'s per-load bookkeeping costs
+    /// more than two uncontended atomics. Contended, the `RwLock` falls apart
+    /// while `ArcSwap` degrades gently. Skewed access is the normal case for
+    /// OLTP, and an engine built for concurrency should not collapse on hot
+    /// rows, so the contended half is the one that decides it.
+    pub(crate) latest: ArcSwapOption<Version<T>>,
     /// Transaction id currently writing this slot, or 0 if free.
     pub(crate) lock: AtomicU64,
     /// SIREAD locks: transactions that have read this slot and may still form
@@ -113,20 +139,26 @@ pub struct Slot<T> {
 impl<T> Slot<T> {
     fn new() -> Self {
         Slot {
-            latest: RwLock::new(None),
+            latest: ArcSwapOption::empty(),
             lock: AtomicU64::new(0),
             readers: Mutex::new(Readers::default()),
         }
     }
 
     /// Walk the chain for the version visible at `snapshot`.
+    ///
+    /// Traversal borrows each hop and clones only the version it returns. The
+    /// previous form cloned the `Arc` at every step, so a reader that walked
+    /// back four versions did four atomic increments and four decrements to
+    /// answer with one of them.
     pub(crate) fn read(&self, snapshot: Timestamp, reader: TxnId) -> Option<Arc<Version<T>>> {
-        let mut cur = self.latest.read().clone();
+        let head = self.latest.load();
+        let mut cur = head.as_ref();
         while let Some(v) = cur {
             if v.visible_to(snapshot, reader) {
-                return Some(v);
+                return Some(Arc::clone(v));
             }
-            cur = v.prev.clone();
+            cur = v.prev.as_ref();
         }
         None
     }
@@ -159,7 +191,7 @@ impl<T> Slot<T> {
 /// across `SLOT_SHARDS` lines.
 const SLOT_SHARDS: usize = 64;
 
-type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>>>;
+type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>, FxBuildHasher>>;
 
 pub struct Table<T: Versioned> {
     id: TableId,
@@ -195,7 +227,7 @@ impl<T: Versioned> Table<T> {
         Table {
             id,
             slots: (0..SLOT_SHARDS)
-                .map(|_| RwLock::new(HashMap::new()))
+                .map(|_| RwLock::new(HashMap::default()))
                 .collect(),
             secondary: T::indexes()
                 .iter()
@@ -209,27 +241,46 @@ impl<T: Versioned> Table<T> {
         self.id
     }
 
-    fn shard(&self, key: &T::Key) -> &RwLock<HashMap<T::Key, Arc<Slot<T>>>> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        &self.slots[(hasher.finish() as usize) % SLOT_SHARDS]
+    fn shard(&self, key: &T::Key) -> &SlotShard<T> {
+        &self.slots[(crate::hash::hash_one(key) as usize) % SLOT_SHARDS]
     }
 
-    pub(crate) fn slot(&self, key: &T::Key) -> Option<Arc<Slot<T>>> {
-        self.shard(key).read().get(key).cloned()
+    /// Borrow the slot for `key`, for as long as the table is borrowed.
+    ///
+    /// A reference rather than an `Arc`, for the same reason `Database::table`
+    /// is: this is on every lookup, and the clone was an atomic increment and
+    /// decrement per operation.
+    ///
+    /// # Safety
+    ///
+    /// The borrow is extended from the shard's read guard to `&self`. Sound
+    /// because the slot map is **append-only** — `slot_or_create` inserts and
+    /// nothing ever removes — so the `Arc` owning this `Slot` lives as long as
+    /// the table, and the `Slot` itself is on the heap and never moves. The map
+    /// rehashing moves the `Arc`, not its referent.
+    ///
+    /// A delete does not remove a slot; it installs a tombstone version, so
+    /// readers at older snapshots still find the record. If garbage collection
+    /// ever starts reclaiming empty slots, this reasoning breaks and both
+    /// methods have to go back to returning an `Arc`.
+    pub(crate) fn slot(&self, key: &T::Key) -> Option<&Slot<T>> {
+        let shard = self.shard(key).read();
+        let slot: &Slot<T> = shard.get(key)?;
+        // SAFETY: see the doc comment above.
+        Some(unsafe { &*(slot as *const Slot<T>) })
     }
 
-    /// Fetch the slot for `key`, creating an empty one if absent.
-    pub(crate) fn slot_or_create(&self, key: &T::Key) -> Arc<Slot<T>> {
+    /// Borrow the slot for `key`, creating an empty one if absent.
+    pub(crate) fn slot_or_create(&self, key: &T::Key) -> &Slot<T> {
         if let Some(s) = self.slot(key) {
             return s;
         }
-        self.shard(key)
-            .write()
+        let mut shard = self.shard(key).write();
+        let slot: &Slot<T> = shard
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(Slot::new()))
-            .clone()
+            .or_insert_with(|| Arc::new(Slot::new()));
+        // SAFETY: see `Table::slot`.
+        unsafe { &*(slot as *const Slot<T>) }
     }
 
     /// Record `record`'s index keys as candidates.

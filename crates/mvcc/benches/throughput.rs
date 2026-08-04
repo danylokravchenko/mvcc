@@ -9,8 +9,11 @@
 //!
 //! - **point reads** — `tables` RwLock, `slots` RwLock, `Slot::latest` RwLock.
 //!   One transaction per 100 reads, so per-transaction costs amortise away.
-//! - **read-only txns** — the same reads, one transaction each. The difference
-//!   from the row above is the `Oracle`'s two mutexes.
+//! - **point reads (hot)** — the same, but every thread on the same four rows.
+//!   Uniform keys leave per-slot synchronisation uncontended and therefore
+//!   invisible; this is the workload that shows it.
+//! - **read-only txns** — one transaction per read. The difference from the
+//!   first row is the `Oracle`'s per-transaction cost.
 //! - **write txns** — adds the global commit lock and the rest of the commit
 //!   path.
 //!
@@ -56,6 +59,8 @@ struct Row {
 }
 
 const ROWS: u64 = 10_000;
+/// Keys every thread contends on, for the hot-row read workload.
+const HOT_ROWS: u64 = 4;
 const RUN: Duration = Duration::from_millis(700);
 /// Odd, so the median is a measured value rather than the mean of two.
 const SAMPLES: usize = 5;
@@ -93,6 +98,18 @@ fn main() -> Result<()> {
         100
     });
     reads.report("point reads (100 per txn)");
+
+    // Every thread hammers the same handful of rows. Uniform keys spread across
+    // 10k slots leave per-slot synchronisation uncontended and so invisible;
+    // this is where it shows.
+    let hot = sample(threads, &db, |db, rng| {
+        let mut tx = db.begin_with::<Snapshot>();
+        for _ in 0..100 {
+            let _ = tx.get::<Row>(&(rng() % HOT_ROWS)).expect("get");
+        }
+        100
+    });
+    hot.report("point reads (4 hot rows)");
 
     let read_txns = sample(threads, &db, |db, rng| {
         let mut tx = db.begin_with::<Snapshot>();
