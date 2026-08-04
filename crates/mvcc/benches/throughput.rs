@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use mvcc::{Config, Database, Mvcc, Result, Snapshot};
+use mvcc::{Config, Database, Mvcc, Result, Serializable, Snapshot};
 
 #[derive(Mvcc, Clone, Debug)]
 #[mvcc(table = "rows")]
@@ -94,14 +94,29 @@ fn main() -> Result<()> {
             .expect("update");
         1
     });
-    writes.report("write txns");
+    writes.report("write txns (snapshot)");
+
+    // The same work at `Serializable`, which adds SIREAD lock registration on
+    // every read and a reader/predicate scan per write at commit. The gap
+    // between this row and the one above is the price of SSI.
+    let ssi_writes = sample(threads, &db, |db, rng| {
+        let key = rng() % ROWS;
+        db.transaction_with::<Serializable, _, _>(|tx| {
+            let current = tx.get::<Row>(&key)?.map(|r| r.value).unwrap_or(0);
+            tx.update::<Row>(&key, |r| r.value = current + 1).map(|_| ())
+        })
+        .expect("update");
+        1
+    });
+    ssi_writes.report("write txns (serializable)");
 
     // Per-transaction costs, derived from the differences. A value at or below
     // zero means the two workloads are within noise of each other.
     println!(
-        "\n  oracle ≈ {:.0} ns/txn, commit path ≈ {:.0} ns/txn",
+        "\n  oracle ≈ {:.0} ns/txn, commit path ≈ {:.0} ns/txn, SSI ≈ {:.0} ns/txn",
         nanos_each(read_txns.median()) - nanos_each(reads.median()),
         nanos_each(writes.median()) - nanos_each(read_txns.median()),
+        nanos_each(ssi_writes.median()) - nanos_each(writes.median()),
     );
     Ok(())
 }

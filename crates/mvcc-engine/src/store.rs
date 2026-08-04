@@ -49,6 +49,7 @@
 use parking_lot::{Mutex, RwLock};
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
@@ -58,6 +59,7 @@ use mvcc_core::{
 };
 
 use crate::oracle::{Oracle, OracleConfig};
+use crate::ssi::{Readers, TxnState};
 use crate::txn::Transaction;
 
 /// One version of a record.
@@ -70,6 +72,13 @@ pub struct Version<T> {
     pub(crate) end: AtomicU64,
     pub(crate) prev: Option<Arc<Version<T>>>,
     pub(crate) value: Option<T>,
+    /// The transaction that created this version.
+    ///
+    /// Kept so that a reader discovering at commit that its read set changed
+    /// can name the transaction that changed it, and mark that transaction's
+    /// incoming edge. `None` only for versions that predate the process, of
+    /// which there are currently none.
+    pub(crate) writer: Option<Arc<TxnState>>,
 }
 
 impl<T> Version<T> {
@@ -88,6 +97,10 @@ pub struct Slot<T> {
     pub(crate) latest: RwLock<Option<Arc<Version<T>>>>,
     /// Transaction id currently writing this slot, or 0 if free.
     pub(crate) lock: AtomicU64,
+    /// SIREAD locks: transactions that have read this slot and may still form
+    /// an rw-antidependency with a future writer. Only `Serializable`
+    /// transactions ever register, so this stays empty under other levels.
+    pub(crate) readers: Mutex<Readers>,
 }
 
 impl<T> Slot<T> {
@@ -95,6 +108,7 @@ impl<T> Slot<T> {
         Slot {
             latest: RwLock::new(None),
             lock: AtomicU64::new(0),
+            readers: Mutex::new(Readers::default()),
         }
     }
 
@@ -142,6 +156,20 @@ pub struct Table<T: Versioned> {
     /// rollback — at the cost of a recheck per candidate, which the scan is
     /// doing anyway to establish visibility.
     secondary: Vec<RwLock<BTreeMap<IndexKey, BTreeSet<T::Key>>>>,
+    /// Predicate SIREAD locks: predicates that `Serializable` transactions have
+    /// evaluated and that a future insert or update might come to satisfy.
+    ///
+    /// A per-slot reader list cannot express a read of a row that does not
+    /// exist yet, which is exactly what a phantom is. This can: a writer checks
+    /// its new row against every registered predicate, and a match is an
+    /// incoming rw-antidependency.
+    predicate_locks: Mutex<Vec<PredicateLock<T>>>,
+}
+
+/// One registered predicate read, held until its transaction expires.
+struct PredicateLock<T> {
+    state: Arc<TxnState>,
+    predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
 }
 
 impl<T: Versioned> Table<T> {
@@ -153,6 +181,7 @@ impl<T: Versioned> Table<T> {
                 .iter()
                 .map(|_| RwLock::new(BTreeMap::new()))
                 .collect(),
+            predicate_locks: Mutex::new(Vec::new()),
         }
     }
 
@@ -197,8 +226,8 @@ impl<T: Versioned> Table<T> {
     pub(crate) fn index_candidates(
         &self,
         position: usize,
-        lo: std::ops::Bound<IndexKey>,
-        hi: std::ops::Bound<IndexKey>,
+        lo: Bound<IndexKey>,
+        hi: Bound<IndexKey>,
     ) -> Vec<T::Key> {
         let map = self.secondary[position].read();
         map.range((lo, hi))
@@ -212,6 +241,115 @@ impl<T: Versioned> Table<T> {
         let mut keys: Vec<_> = slots.keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Every record visible at `snapshot` that satisfies `predicate`, in
+    /// primary key order.
+    ///
+    /// This is the primitive behind both `Transaction::scan_where` and its
+    /// revalidation at commit. They must agree exactly — a predicate read is
+    /// validated by re-running it and comparing — so they call the same code
+    /// rather than two implementations that could drift.
+    pub(crate) fn matching(
+        &self,
+        snapshot: Timestamp,
+        reader: TxnId,
+        predicate: &dyn Fn(&T) -> bool,
+    ) -> Vec<(T::Key, Arc<Version<T>>)> {
+        let mut out = Vec::new();
+        for key in self.all_keys() {
+            let Some(slot) = self.slot(&key) else { continue };
+            let Some(version) = slot.read(snapshot, reader) else {
+                continue;
+            };
+            let Some(value) = version.value.as_ref() else {
+                continue;
+            };
+            if predicate(value) {
+                out.push((key, version));
+            }
+        }
+        out
+    }
+
+    /// Every record visible at `snapshot` whose key for index `position` falls
+    /// in `[lo, hi]`, in index key order.
+    pub(crate) fn matching_in_index(
+        &self,
+        position: usize,
+        lo: Bound<IndexKey>,
+        hi: Bound<IndexKey>,
+        snapshot: Timestamp,
+        reader: TxnId,
+    ) -> Vec<(T::Key, Arc<Version<T>>)> {
+        let desc = &T::indexes()[position];
+        let in_range = |k: &IndexKey| {
+            let lo_ok = match &lo {
+                Bound::Included(b) => k >= b,
+                Bound::Excluded(b) => k > b,
+                Bound::Unbounded => true,
+            };
+            let hi_ok = match &hi {
+                Bound::Included(b) => k <= b,
+                Bound::Excluded(b) => k < b,
+                Bound::Unbounded => true,
+            };
+            lo_ok && hi_ok
+        };
+
+        // Index entries are candidates, not answers — see `Table::secondary`.
+        // Each is resolved to its visible version and its key re-extracted,
+        // which is what filters out entries left behind by updates and
+        // rolled-back writes.
+        let mut out: Vec<(IndexKey, T::Key, Arc<Version<T>>)> = Vec::new();
+        for key in self.index_candidates(position, lo.clone(), hi.clone()) {
+            let Some(slot) = self.slot(&key) else { continue };
+            let Some(version) = slot.read(snapshot, reader) else {
+                continue;
+            };
+            let Some(value) = version.value.as_ref() else {
+                continue;
+            };
+            let actual = (desc.extract)(value);
+            if in_range(&actual) {
+                out.push((actual, key, version));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.into_iter().map(|(_, k, v)| (k, v)).collect()
+    }
+
+    /// Register that `state` evaluated `predicate` over this table.
+    pub(crate) fn register_predicate(
+        &self,
+        state: &Arc<TxnState>,
+        predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
+    ) {
+        self.predicate_locks.lock().push(PredicateLock {
+            state: Arc::clone(state),
+            predicate,
+        });
+    }
+
+    /// Transactions other than `writer` whose registered predicate `record`
+    /// satisfies — that is, whose predicate read this write turns into a
+    /// phantom.
+    ///
+    /// Purges expired locks while it walks, which is the only place they are
+    /// walked, so the cleanup is already paid for.
+    pub(crate) fn predicate_readers_of(
+        &self,
+        record: &T,
+        writer: TxnId,
+        gc_watermark: Timestamp,
+    ) -> Vec<Arc<TxnState>> {
+        let mut locks = self.predicate_locks.lock();
+        locks.retain(|l| !l.state.is_expired(gc_watermark));
+        locks
+            .iter()
+            .filter(|l| l.state.id() != writer && (l.predicate)(record))
+            .map(|l| Arc::clone(&l.state))
+            .collect()
     }
 
     /// Whether a unique index would be violated by `record`, given a reader's

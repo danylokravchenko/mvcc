@@ -42,7 +42,7 @@
 //! for. `parking_lot` buys roughly 2x; deleting the sets buys the rest.
 
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mvcc_core::{Timestamp, TxnId};
@@ -86,7 +86,14 @@ pub struct Oracle {
     /// Commit timestamps allocated but not yet fully installed.
     installing: Mutex<BTreeSet<u64>>,
     /// Snapshots of live transactions, for the GC watermark.
-    active: Mutex<BTreeSet<u64>>,
+    ///
+    /// A multiset — snapshot to the number of transactions holding it — not a
+    /// set. Transactions that begin before any commit lands all share the same
+    /// snapshot value, so a plain `BTreeSet` would let the first of them to
+    /// finish deregister the others. The watermark would then advance past
+    /// snapshots that are still live, and versions those transactions can still
+    /// reach would become eligible for reclamation.
+    active: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl Oracle {
@@ -98,7 +105,7 @@ impl Oracle {
             next: AtomicU64::new(1),
             read_watermark: AtomicU64::new(0),
             installing: Mutex::new(BTreeSet::new()),
-            active: Mutex::new(BTreeSet::new()),
+            active: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -129,7 +136,7 @@ impl Oracle {
     pub fn begin_snapshot(&self) -> Timestamp {
         let mut active = self.active.lock();
         let ts = Timestamp(self.read_watermark.load(Ordering::Acquire));
-        active.insert(ts.raw());
+        *active.entry(ts.raw()).or_insert(0) += 1;
         ts
     }
 
@@ -142,7 +149,12 @@ impl Oracle {
     /// Drop a transaction's registration when it commits or aborts.
     pub fn release_snapshot(&self, ts: Timestamp) {
         let mut active = self.active.lock();
-        active.remove(&ts.raw());
+        if let std::collections::btree_map::Entry::Occupied(mut e) = active.entry(ts.raw()) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
     }
 
     /// Allocate a commit timestamp and mark it as installing.
@@ -182,15 +194,15 @@ impl Oracle {
     /// classic MVCC failure mode. See [`crate::gc`].
     pub fn gc_watermark(&self) -> Timestamp {
         let active = self.active.lock();
-        match active.first() {
-            Some(&oldest) => Timestamp(oldest),
+        match active.first_key_value() {
+            Some((&oldest, _)) => Timestamp(oldest),
             None => Timestamp(self.read_watermark.load(Ordering::Acquire)),
         }
     }
 
     /// Number of live transactions, for [`crate::gc::GcStats`].
     pub fn active_count(&self) -> usize {
-        self.active.lock().len()
+        self.active.lock().values().sum()
     }
 }
 
@@ -238,6 +250,30 @@ mod tests {
             o.gc_watermark() > old_reader,
             "releasing it lets GC advance"
         );
+    }
+
+    #[test]
+    fn transactions_sharing_a_snapshot_are_counted_separately() {
+        // Regression: every transaction that begins before the first commit
+        // gets the same snapshot value. Tracking them in a set rather than a
+        // multiset let the first to finish deregister the rest, which advanced
+        // the GC watermark past snapshots that were still live.
+        let o = Oracle::new(OracleConfig::Centralised);
+        let a = o.begin_snapshot();
+        let b = o.begin_snapshot();
+        assert_eq!(a, b, "both began before anything committed");
+        assert_eq!(o.active_count(), 2);
+
+        let ts = o.begin_commit();
+        o.publish(ts);
+
+        o.release_snapshot(a);
+        assert_eq!(o.active_count(), 1, "b is still running");
+        assert_eq!(o.gc_watermark(), b, "b's snapshot must still pin GC");
+
+        o.release_snapshot(b);
+        assert_eq!(o.active_count(), 0);
+        assert!(o.gc_watermark() > b, "now GC may advance");
     }
 
     #[test]

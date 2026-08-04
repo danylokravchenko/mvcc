@@ -1,15 +1,16 @@
 //! The transaction handle — the type users actually touch.
 
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mvcc_core::isolation::{ReadTracker, SlotRef};
 use mvcc_core::{
-    Encodable, Error, IsolationLevel, Result, Timestamp, TxnId, Versioned, Visibility,
+    Encodable, Error, IndexKey, IsolationLevel, Result, Timestamp, TxnId, Versioned, Visibility,
 };
 
-use crate::store::{Database, Slot, Version};
+use crate::ssi::TxnState;
+use crate::store::{Database, Slot, Table, Version};
 
 /// A write this transaction has installed but not yet committed.
 ///
@@ -19,9 +20,18 @@ trait WriteOp: Send + Sync {
     fn commit(&self, ts: Timestamp);
     /// Unlink the new version, restoring the slot to what it was.
     fn abort(&self);
+    /// Transactions that read what this write overwrites — the incoming half of
+    /// the SSI pivot test.
+    ///
+    /// Two sources, and both are needed. The slot's SIREAD locks cover readers
+    /// of the row as it was. The table's registered predicates cover readers of
+    /// rows that did not exist when they looked, which is what an insert turns
+    /// into a phantom.
+    fn conflicting_readers(&self, txn: TxnId, gc: Timestamp) -> Vec<Arc<TxnState>>;
 }
 
-struct SlotWrite<T> {
+struct SlotWrite<T: Versioned> {
+    table: Arc<Table<T>>,
     slot: Arc<Slot<T>>,
     installed: Arc<Version<T>>,
     /// The version `installed` displaced, whose `end` must be stamped on commit
@@ -30,7 +40,7 @@ struct SlotWrite<T> {
     txn: TxnId,
 }
 
-impl<T: Send + Sync> WriteOp for SlotWrite<T> {
+impl<T: Versioned> WriteOp for SlotWrite<T> {
     fn commit(&self, ts: Timestamp) {
         // Order matters. The new version becomes visible only once `begin`
         // holds a real timestamp, so stamping the old version's `end` first
@@ -46,11 +56,34 @@ impl<T: Send + Sync> WriteOp for SlotWrite<T> {
         *self.slot.latest.write() = self.replaced.clone();
         self.slot.unlock(self.txn);
     }
+
+    fn conflicting_readers(&self, txn: TxnId, gc: Timestamp) -> Vec<Arc<TxnState>> {
+        let mut readers = self.slot.readers.lock().others(txn, gc);
+        if let Some(value) = self.installed.value.as_ref() {
+            readers.extend(self.table.predicate_readers_of(value, txn, gc));
+        }
+        // A delete makes a row vanish from predicates that matched it, so the
+        // version it replaced has to be checked too.
+        if let Some(previous) = self.replaced.as_ref().and_then(|v| v.value.as_ref()) {
+            readers.extend(self.table.predicate_readers_of(previous, txn, gc));
+        }
+        readers
+    }
 }
 
-/// Re-checks at commit that a value this transaction read has not changed.
+/// Re-checks at commit that what this transaction read has not changed.
+///
+/// Returns the transactions responsible for any change rather than a bare
+/// `bool`, because SSI needs to mark *their* incoming edge as well as this
+/// transaction's outgoing one. An empty result means the read is still valid.
+///
+/// Anything this reports has necessarily committed: revalidation reads at the
+/// current read watermark, which by construction only covers commits that are
+/// fully installed. That is what satisfies Cahill's "the transaction on the
+/// outgoing edge commits first" condition without tracking commit order
+/// separately.
 trait ReadValidation: Send + Sync {
-    fn still_valid(&self, now: Timestamp) -> bool;
+    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>>;
 }
 
 struct SlotRead<T> {
@@ -59,17 +92,115 @@ struct SlotRead<T> {
 }
 
 impl<T: Send + Sync> ReadValidation for SlotRead<T> {
-    fn still_valid(&self, now: Timestamp) -> bool {
+    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
         // Read as nobody, so this transaction's own in-flight writes stay
         // invisible. Validating as ourselves would compare what we read against
         // what we then wrote, and every read-modify-write would abort itself.
         let current = self.slot.read(now, TxnId::NONE);
-        match (&self.observed, &current) {
+        let unchanged = match (&self.observed, &current) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
+        };
+        if unchanged {
+            Vec::new()
+        } else {
+            current.and_then(|v| v.writer.clone()).into_iter().collect()
         }
     }
+}
+
+/// A predicate a transaction evaluated, and the rows that satisfied it.
+///
+/// This is what closes the phantom hole. A [`SlotRead`] can only speak for a row
+/// that existed when it was read; a row inserted afterwards has no slot to
+/// compare against, so a read set built only from slots cannot express *"and
+/// nothing else matched"*. Re-running the predicate at commit can.
+///
+/// Validation compares both the set of matching keys and the identity of each
+/// matching version, so one entry covers phantoms (a key appears or disappears)
+/// and item changes (a key's version was replaced) together.
+struct PredicateRead<T: Versioned> {
+    table: Arc<Table<T>>,
+    predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
+    observed: Vec<(T::Key, Arc<Version<T>>)>,
+}
+
+impl<T: Versioned> ReadValidation for PredicateRead<T> {
+    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
+        let current = self.table.matching(now, TxnId::NONE, &*self.predicate);
+        writers_of_change(&self.table, &self.observed, &current, now)
+    }
+}
+
+/// An index range a transaction scanned, and the rows it returned.
+///
+/// The range *is* the predicate, so revalidation re-runs the range scan rather
+/// than a full table scan — the same reason the index exists in the first place.
+struct IndexRangeRead<T: Versioned> {
+    table: Arc<Table<T>>,
+    position: usize,
+    lo: Bound<IndexKey>,
+    hi: Bound<IndexKey>,
+    observed: Vec<(T::Key, Arc<Version<T>>)>,
+}
+
+impl<T: Versioned> ReadValidation for IndexRangeRead<T> {
+    fn conflicting_writers(&self, now: Timestamp) -> Vec<Arc<TxnState>> {
+        let current = self.table.matching_in_index(
+            self.position,
+            self.lo.clone(),
+            self.hi.clone(),
+            now,
+            TxnId::NONE,
+        );
+        writers_of_change(&self.table, &self.observed, &current, now)
+    }
+}
+
+/// The transactions responsible for a predicate's result set changing, or empty
+/// if it is unchanged in both membership and version identity.
+///
+/// A result set can change in two directions and both matter:
+///
+/// - a row **entered** it, or an existing row's version was replaced. The
+///   responsible transaction wrote the version now in the set.
+/// - a row **left** it, because an update moved it out of the predicate. The
+///   responsible transaction wrote a version that is *not* in the set at all,
+///   so it has to be fetched from the slot.
+///
+/// Missing the second case is easy and quiet: the predicate correctly reports
+/// that it changed, but names nobody, so no rw-edge is recorded and the pivot
+/// test never fires.
+fn writers_of_change<T: Versioned>(
+    table: &Table<T>,
+    observed: &[(T::Key, Arc<Version<T>>)],
+    current: &[(T::Key, Arc<Version<T>>)],
+    now: Timestamp,
+) -> Vec<Arc<TxnState>> {
+    let mut writers = Vec::new();
+
+    for (key, version) in current {
+        let same_as_observed = observed
+            .iter()
+            .any(|(ko, vo)| ko == key && Arc::ptr_eq(vo, version));
+        if !same_as_observed {
+            writers.extend(version.writer.clone());
+        }
+    }
+
+    for (key, _) in observed {
+        if current.iter().any(|(kc, _)| kc == key) {
+            continue;
+        }
+        if let Some(slot) = table.slot(key)
+            && let Some(version) = slot.read(now, TxnId::NONE)
+        {
+            writers.extend(version.writer.clone());
+        }
+    }
+
+    writers
 }
 
 /// A transaction at isolation level `I`.
@@ -81,23 +212,33 @@ pub struct Transaction<'db, I: IsolationLevel> {
     db: &'db Database,
     id: TxnId,
     snapshot: Timestamp,
-    tracker: I::ReadTracker,
+    /// Shared with other transactions, which set this one's conflict flags.
+    /// Outlives the `Transaction`: SIREAD locks and version records keep
+    /// referring to it after commit. See [`crate::ssi`].
+    state: Arc<TxnState>,
     writes: Vec<Box<dyn WriteOp>>,
     /// Empty, and never pushed to, unless `I::VALIDATES_READS`.
     reads: Vec<Box<dyn ReadValidation>>,
     done: bool,
+    /// `I` appears in no field: every difference between the levels is a
+    /// `const` on [`IsolationLevel`], so the type parameter exists purely to
+    /// select those constants at compile time.
+    _level: PhantomData<fn() -> I>,
 }
 
 impl<'db, I: IsolationLevel> Transaction<'db, I> {
     pub(crate) fn new(db: &'db Database) -> Self {
+        let id = db.oracle().next_txn_id();
+        let snapshot = db.oracle().begin_snapshot();
         Transaction {
-            id: db.oracle().next_txn_id(),
-            snapshot: db.oracle().begin_snapshot(),
+            id,
+            snapshot,
+            state: TxnState::new(id, snapshot),
             db,
-            tracker: I::ReadTracker::default(),
             writes: Vec::new(),
             reads: Vec::new(),
             done: false,
+            _level: PhantomData,
         }
     }
 
@@ -145,6 +286,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // on "this key does not exist" must abort if someone creates it.
             if I::VALIDATES_READS {
                 let slot = table.slot_or_create(key);
+                slot.readers.lock().register(&self.state);
                 self.reads.push(Box::new(SlotRead::<T> {
                     slot,
                     observed: None,
@@ -156,8 +298,8 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let version = slot.read(snapshot, self.id);
 
         if I::VALIDATES_READS {
-            self.tracker
-                .observe(SlotRef(Arc::as_ptr(&slot) as usize), snapshot);
+            // SIREAD lock: a later writer of this slot needs to know we read it.
+            slot.readers.lock().register(&self.state);
             self.reads.push(Box::new(SlotRead::<T> {
                 slot: slot.clone(),
                 observed: version.clone(),
@@ -213,11 +355,13 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             end: std::sync::atomic::AtomicU64::new(Timestamp::MAX.raw()),
             prev: replaced.clone(),
             value,
+            writer: Some(Arc::clone(&self.state)),
         });
 
         *slot.latest.write() = Some(installed.clone());
 
         self.writes.push(Box::new(SlotWrite {
+            table: table.clone(),
             slot,
             installed,
             replaced,
@@ -327,37 +471,88 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     }
 
     /// Every record of `T` visible at this snapshot, in primary key order.
+    ///
+    /// Equivalent to [`Transaction::scan_where`] with a predicate that accepts
+    /// everything. Under `Serializable` that means the *whole table* becomes
+    /// part of the read set, so any concurrent insert or update anywhere in it
+    /// will abort this transaction. Prefer `scan_where` when you have a
+    /// predicate: it is both faster to validate and far less likely to abort.
     pub fn scan<T: Versioned>(&mut self) -> Result<Vec<Ref<T>>> {
+        self.scan_where::<T, _>(|_| true)
+    }
+
+    /// Every record of `T` visible at this snapshot that satisfies `predicate`,
+    /// in primary key order.
+    ///
+    /// The predicate is handed to the engine rather than applied by the caller
+    /// afterwards, and that is the entire point under `Serializable`: the
+    /// engine records it, re-evaluates it at commit, and aborts if the set of
+    /// matching rows changed. That is what makes phantoms visible — see
+    /// [`PredicateRead`] — and it is why
+    ///
+    /// ```ignore
+    /// tx.scan_where::<Account, _>(|a| a.balance < 0)?
+    /// ```
+    ///
+    /// is a materially stronger statement than
+    ///
+    /// ```ignore
+    /// tx.scan::<Account>()?.into_iter().filter(|a| a.balance < 0)
+    /// ```
+    ///
+    /// The second form tells the engine only that you read the whole table.
+    ///
+    /// `predicate` must be `Send + Sync + 'static` because it is retained for
+    /// the transaction's lifetime and re-run at commit. It should be pure:
+    /// it will be called more than once, and on rows this call never returns.
+    pub fn scan_where<T, P>(&mut self, predicate: P) -> Result<Vec<Ref<T>>>
+    where
+        T: Versioned,
+        P: Fn(&T) -> bool + Send + Sync + 'static,
+    {
         self.ensure_live()?;
         let table = self.db.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
-        let mut out = Vec::new();
-        for key in table.all_keys() {
-            let Some(slot) = table.slot(&key) else {
-                continue;
+        let predicate: Arc<dyn Fn(&T) -> bool + Send + Sync> = Arc::new(predicate);
+        let matched = table.matching(snapshot, self.id, &*predicate);
+
+        if I::VALIDATES_READS {
+            // Recorded as seen by *nobody*, so this transaction's own
+            // uncommitted writes stay out of its own read set — otherwise
+            // inserting a row that matches your own predicate would abort you.
+            // With nothing written yet the two views coincide, which is the
+            // common case and saves a second pass over the table.
+            let observed = if self.writes.is_empty() {
+                matched.clone()
+            } else {
+                table.matching(snapshot, TxnId::NONE, &*predicate)
             };
-            let Some(version) = slot.read(snapshot, self.id) else {
-                continue;
-            };
-            if version.value.is_none() {
-                continue;
-            }
-            if I::VALIDATES_READS {
-                self.reads.push(Box::new(SlotRead::<T> {
-                    slot: slot.clone(),
-                    observed: Some(version.clone()),
-                }));
-            }
-            out.push(Ref { version });
+            // Predicate SIREAD lock: a later insert has to be checked against
+            // this predicate, since a row that does not exist yet has no slot
+            // to register on. This is what makes phantoms detectable.
+            table.register_predicate(&self.state, Arc::clone(&predicate));
+            self.reads.push(Box::new(PredicateRead {
+                table: table.clone(),
+                predicate,
+                observed,
+            }));
         }
-        Ok(out)
+
+        Ok(matched
+            .into_iter()
+            .map(|(_, version)| Ref { version })
+            .collect())
     }
 
     /// Range scan over a secondary index, in index key order.
     ///
     /// The index is named by the `&'static str` the derive produced, so a typo
     /// is an error rather than an empty result.
+    ///
+    /// Under `Serializable` the range is recorded and re-scanned at commit, so
+    /// a concurrent insert *into the range* aborts this transaction while one
+    /// outside it does not.
     pub fn scan_index<T, K, R>(&mut self, index: &str, range: R) -> Result<Vec<Ref<T>>>
     where
         T: Versioned,
@@ -374,69 +569,117 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
                 table: T::TABLE_NAME,
                 index: index.to_string(),
             })?;
-        let desc = &T::indexes()[position];
 
         let encode_bound = |b: Bound<&K>| match b {
             Bound::Included(k) => Bound::Included(k.encode()),
             Bound::Excluded(k) => Bound::Excluded(k.encode()),
             Bound::Unbounded => Bound::Unbounded,
         };
+        let lo = encode_bound(range.start_bound());
+        let hi = encode_bound(range.end_bound());
 
-        let candidates = table.index_candidates(
-            position,
-            encode_bound(range.start_bound()),
-            encode_bound(range.end_bound()),
-        );
+        let matched =
+            table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id);
 
-        // Index entries are candidates, not answers — see `Table::secondary`.
-        // Each one is resolved to its visible version and its key re-extracted,
-        // which also filters out entries left behind by updates and rollbacks.
-        let mut out = Vec::new();
-        for key in candidates {
-            let Some(slot) = table.slot(&key) else {
-                continue;
-            };
-            let Some(version) = slot.read(snapshot, self.id) else {
-                continue;
-            };
-            let Some(value) = version.value.as_ref() else {
-                continue;
-            };
+        if I::VALIDATES_READS {
+            let observed =
+                table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, TxnId::NONE);
 
-            let actual = (desc.extract)(value);
-            let (lo, hi) = (range.start_bound(), range.end_bound());
-            let in_range = {
-                let lo_ok = match lo {
-                    Bound::Included(k) => actual >= k.encode(),
-                    Bound::Excluded(k) => actual > k.encode(),
-                    Bound::Unbounded => true,
-                };
-                let hi_ok = match hi {
-                    Bound::Included(k) => actual <= k.encode(),
-                    Bound::Excluded(k) => actual < k.encode(),
-                    Bound::Unbounded => true,
-                };
-                lo_ok && hi_ok
-            };
-            if !in_range {
-                continue;
-            }
+            // The range is a predicate over the indexed column, so it registers
+            // like any other: an insert landing inside the range is a phantom
+            // for this read.
+            let extract = T::indexes()[position].extract;
+            let (plo, phi) = (lo.clone(), hi.clone());
+            table.register_predicate(
+                &self.state,
+                Arc::new(move |record: &T| {
+                    let k = extract(record);
+                    let lo_ok = match &plo {
+                        Bound::Included(b) => k >= *b,
+                        Bound::Excluded(b) => k > *b,
+                        Bound::Unbounded => true,
+                    };
+                    let hi_ok = match &phi {
+                        Bound::Included(b) => k <= *b,
+                        Bound::Excluded(b) => k < *b,
+                        Bound::Unbounded => true,
+                    };
+                    lo_ok && hi_ok
+                }),
+            );
 
-            if I::VALIDATES_READS {
-                self.reads.push(Box::new(SlotRead::<T> {
-                    slot: slot.clone(),
-                    observed: Some(version.clone()),
-                }));
-            }
-            out.push(Ref { version });
+            self.reads.push(Box::new(IndexRangeRead {
+                table: table.clone(),
+                position,
+                lo,
+                hi,
+                observed,
+            }));
         }
 
-        out.sort_by_key(|r| {
-            (desc.extract)(r.version.value.as_ref().expect("filtered above"))
-                .0
-                .clone()
-        });
-        Ok(out)
+        Ok(matched.into_iter().map(|(_, version)| Ref { version }).collect())
+    }
+
+    /// The SSI pivot test: abort only when this transaction has an
+    /// rw-antidependency edge in *both* directions.
+    ///
+    /// Returns `true` if the transaction may commit. Runs under the commit
+    /// lock, so the two halves see a consistent world.
+    ///
+    /// The predecessor to this was "abort if anything I read changed", i.e. the
+    /// outgoing edge alone. That is sound but aborts transactions that are in
+    /// no cycle at all — a transaction that read a row someone else updated,
+    /// but whose own writes nobody read, can always be ordered before that
+    /// someone. Requiring both edges is Cahill's rule and is still sufficient:
+    /// every cycle contains a transaction with two consecutive rw edges.
+    fn serializable_check_passes(&self) -> bool {
+        if self.state.is_aborted() {
+            return false;
+        }
+
+        let now = self.db.oracle().statement_snapshot();
+        let gc = self.db.oracle().gc_watermark();
+
+        // --- outgoing edges: did anything I read change under me? -----------
+        for read in &self.reads {
+            for writer in read.conflicting_writers(now) {
+                self.state.set_out_conflict();
+                // The other side of the same edge. It may already have
+                // committed, in which case marking it is how a *later*
+                // transaction learns the structure exists.
+                writer.set_in_conflict();
+
+                // If naming that edge just turned an already-committed
+                // transaction into a pivot, the cycle runs through a
+                // transaction we can no longer abort. Abort ourselves instead:
+                // we are a participant, so removing us breaks it too.
+                if writer.is_pivot() && writer.is_committed() {
+                    return false;
+                }
+            }
+        }
+
+        // --- incoming edges: did anyone read what I overwrote? --------------
+        // Only worth asking if we have an outgoing edge, since a pivot needs
+        // both and this half is the expensive one.
+        if self.state.is_pivot() {
+            return false;
+        }
+        if self.out_conflict_present() {
+            for write in &self.writes {
+                for reader in write.conflicting_readers(self.id, gc) {
+                    reader.set_out_conflict();
+                    self.state.set_in_conflict();
+                }
+            }
+        }
+
+        !self.state.is_pivot()
+    }
+
+    fn out_conflict_present(&self) -> bool {
+        // `is_pivot` needs both; this asks for the outgoing half alone.
+        self.state.has_out_conflict()
     }
 
     /// Commit.
@@ -483,17 +726,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // `tests/hermitage.rs::g1b_*`, which is exactly that shape.
             let needs_validation = I::VALIDATES_READS && !self.writes.is_empty();
 
-            if needs_validation {
-                let now = self.db.oracle().statement_snapshot();
-                // Conservative OCC validation: abort if anything we read has
-                // changed. More aggressive than SSI's pivot detection, which
-                // would let through some of these, but it is sound and it is
-                // what makes write skew impossible at this level.
-                if !self.reads.iter().all(|r| r.still_valid(now)) || !self.tracker.validate() {
-                    drop(_guard);
-                    self.rollback();
-                    return Err(Error::SerializationFailure);
-                }
+            if needs_validation && !self.serializable_check_passes() {
+                drop(_guard);
+                self.rollback();
+                return Err(Error::SerializationFailure);
             }
 
             let ts = self.db.oracle().begin_commit();
@@ -506,6 +742,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // correctly on its own; this is belt-and-braces for as long as the
             // global lock exists, and the two must stay consistent when it goes.
             self.db.oracle().publish(ts);
+            self.state.mark_committed(ts);
         };
 
         self.db.oracle().release_snapshot(self.snapshot);
@@ -529,6 +766,9 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         for write in self.writes.iter().rev() {
             write.abort();
         }
+        // Frees this transaction's SIREAD locks: an aborted transaction's reads
+        // never constrained anyone. See `TxnState::is_expired`.
+        self.state.mark_aborted();
         self.db.oracle().release_snapshot(self.snapshot);
         self.done = true;
     }

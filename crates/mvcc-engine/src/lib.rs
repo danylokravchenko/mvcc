@@ -3,6 +3,7 @@
 pub mod gc;
 pub mod index;
 pub mod oracle;
+pub mod ssi;
 pub mod store;
 pub mod txn;
 

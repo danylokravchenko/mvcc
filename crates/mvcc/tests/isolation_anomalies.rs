@@ -4,7 +4,7 @@
 //! each anomaly is tested in both directions: it must occur at the levels that
 //! permit it and must not occur at the levels that do not.
 
-use mvcc::{Config, Database, Mvcc, ReadCommitted, Result, Serializable, Snapshot};
+use mvcc::{Config, Database, Error, Mvcc, ReadCommitted, Result, Serializable, Snapshot};
 
 #[derive(Mvcc, Clone, Debug, PartialEq)]
 #[mvcc(table = "items")]
@@ -223,15 +223,73 @@ fn read_only_serializable_transactions_never_abort() -> Result<()> {
     assert_eq!(reader.get::<Item>(&1)?.unwrap().value, 10);
     reader.commit()?;
 
-    // But a transaction that writes even once is validated again.
+    Ok(())
+}
+
+#[test]
+fn an_outgoing_edge_alone_does_not_abort() -> Result<()> {
+    // This is what SSI buys over "abort if anything I read changed".
+    //
+    // T reads row 1, a concurrent transaction overwrites row 1, and T then
+    // writes row 2 — which nobody has read. T has an outgoing rw-edge and no
+    // incoming one, so it sits in no cycle: order T before the other
+    // transaction and the schedule is serial. The old rule aborted T anyway.
+    let db = db_with(&[(1, "a", 10), (2, "a", 20)])?;
+
+    let mut t = db.begin_with::<Serializable>();
+    assert_eq!(t.get::<Item>(&1)?.unwrap().value, 10);
+
+    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 999).map(|_| ()))?;
+
+    t.update::<Item>(&2, |i| i.value = 2)?;
+    t.commit()?;
+
+    let mut check = db.begin();
+    assert_eq!(check.get::<Item>(&1)?.unwrap().value, 999);
+    assert_eq!(check.get::<Item>(&2)?.unwrap().value, 2);
+    Ok(())
+}
+
+#[test]
+fn an_incoming_edge_alone_does_not_abort() -> Result<()> {
+    // The mirror image: a transaction writes a row that a concurrent
+    // transaction read, but nothing it read was overwritten. Incoming edge
+    // only, so no cycle.
+    let db = db_with(&[(1, "a", 10), (2, "a", 20)])?;
+
+    let mut reader = db.begin_with::<Serializable>();
+    assert_eq!(reader.get::<Item>(&1)?.unwrap().value, 10);
+
     let mut writer = db.begin_with::<Serializable>();
-    assert_eq!(writer.get::<Item>(&1)?.unwrap().value, 999);
-    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 1).map(|_| ()))?;
-    writer.update::<Item>(&2, |i| i.value = 2)?;
-    assert!(
-        writer.commit().is_err(),
-        "a writing transaction is still checked"
-    );
+    writer.update::<Item>(&1, |i| i.value = 11)?;
+    writer.commit()?;
+
+    reader.commit()?;
+    Ok(())
+}
+
+#[test]
+fn both_edges_together_abort() -> Result<()> {
+    // Add the second edge to `an_outgoing_edge_alone_does_not_abort` and the
+    // same transaction must now fail: someone read what it wrote, and someone
+    // overwrote what it read.
+    let db = db_with(&[(1, "a", 10), (2, "a", 20)])?;
+
+    // `peer` reads row 2, which becomes T's incoming edge once T writes row 2.
+    let mut peer = db.begin_with::<Serializable>();
+    assert_eq!(peer.get::<Item>(&2)?.unwrap().value, 20);
+
+    let mut t = db.begin_with::<Serializable>();
+    assert_eq!(t.get::<Item>(&1)?.unwrap().value, 10);
+
+    // T's outgoing edge: row 1 is overwritten under it.
+    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value = 999).map(|_| ()))?;
+
+    t.update::<Item>(&2, |i| i.value = 2)?;
+
+    let err = t.commit().expect_err("in + out is a dangerous structure");
+    assert!(matches!(err, Error::SerializationFailure), "{err}");
+    drop(peer);
     Ok(())
 }
 

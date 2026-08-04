@@ -14,7 +14,7 @@
 //! | `ReadCommitted`  | ✓  | ✓   | ✓   | ✓   | ✓   | —   | ✓* | —        | —       | —  |
 //! | `RepeatableRead` | ✓  | ✓   | ✓   | ✓   | ✓   | ✓   | ✓  | ✓        | —       | —  |
 //! | `Snapshot`       | ✓  | ✓   | ✓   | ✓   | ✓   | ✓   | ✓  | ✓        | —       | —  |
-//! | `Serializable`   | ✓  | ✓   | ✓   | ✓   | ✓   | ✓   | ✓  | ✓        | ✓       | **—** |
+//! | `Serializable`   | ✓  | ✓   | ✓   | ✓   | ✓   | ✓   | ✓  | ✓        | ✓       | ✓  |
 //!
 //! Read-only transactions never abort at any level, including `Serializable`
 //! — see `read_only_serializable_transactions_never_abort` in
@@ -34,11 +34,18 @@
 //! [`p4_lost_update_via_stale_write_is_possible_at_read_committed`] shows the
 //! one shape that does still get through.
 //!
-//! **`G2` under `Serializable` is a genuine gap, not a design choice.** See
-//! [`g2_predicate_write_skew_is_not_prevented`] for why: read validation tracks
-//! the *slots this transaction read*, and a row that did not exist at read time
-//! has no slot to track. Phantoms are therefore invisible to it. This is the
-//! difference between item-level and predicate-level anti-dependency tracking.
+//! `Serializable` is SSI: a transaction aborts only when it has an
+//! rw-antidependency edge in *both* directions (see `mvcc_engine::ssi`). An
+//! outgoing edge alone — something you read was overwritten — is no longer
+//! enough, because such a transaction sits in no cycle. Several transcripts
+//! below rely on that.
+//!
+//! **`G2` is prevented, but only for predicates the engine can see.** Use
+//! [`Transaction::scan_where`], not `scan().filter(..)`: the first records the
+//! predicate and re-evaluates it at commit, which is what makes a phantom
+//! detectable. The second records "I read the whole table" — still sound, but it
+//! aborts on any concurrent write to the table at all. See
+//! [`scan_then_filter_is_sound_but_far_more_likely_to_abort`].
 //!
 //! # Translating "BLOCKS"
 //!
@@ -79,14 +86,18 @@ fn value<I: IsolationLevel>(tx: &mut Transaction<'_, I>, id: u64) -> Result<Opti
 }
 
 /// `select * from test where <predicate>`, as `(id, value)` pairs in key order.
+///
+/// Uses `scan_where` rather than `scan(..).filter(..)` so the predicate reaches
+/// the engine. That distinction is the whole of G2: a filter applied afterwards
+/// tells the engine only that the transaction read the entire table, whereas a
+/// predicate it holds can be re-evaluated at commit to detect phantoms.
 fn matching<I: IsolationLevel>(
     tx: &mut Transaction<'_, I>,
-    predicate: impl Fn(i64) -> bool,
+    predicate: impl Fn(i64) -> bool + Send + Sync + 'static,
 ) -> Result<Vec<(u64, i64)>> {
     Ok(tx
-        .scan::<Test>()?
+        .scan_where::<Test, _>(move |r| predicate(r.value))?
         .iter()
-        .filter(|r| predicate(r.value))
         .map(|r| (r.id, r.value))
         .collect())
 }
@@ -721,27 +732,18 @@ fn g2_item_write_skew_possible_below_serializable() -> Result<()> {
 /// select * from test where value % 3 = 0; -- Either. Returns 3 => 30, 4 => 42
 /// ```
 ///
-/// # This engine does not prevent it, and the reason is structural
+/// # How this is prevented
 ///
-/// `Serializable` validates reads by recording the *slots* a transaction read
-/// and re-checking them at commit (`Transaction::commit`). Both transactions
-/// here read rows 1 and 2 and neither modifies them, so both read sets validate
-/// cleanly — and rows 3 and 4 did not exist at read time, so there was no slot
-/// to record. The read set cannot represent "and nothing else matched".
+/// A read set built from slots cannot express "and nothing else matched": rows
+/// 3 and 4 did not exist when the predicates were evaluated, so there was no
+/// slot to record. `scan_where` therefore records the *predicate itself*
+/// alongside its result set, and commit re-evaluates it — see `PredicateRead`
+/// in `mvcc_engine::txn`.
 ///
-/// That is the difference between item-level and predicate-level
-/// anti-dependency tracking. Two ways to close it:
-///
-/// - **Re-run the predicate at commit.** Record the scan and its result set,
-///   re-execute at commit time, abort if the set changed. Simple, exact, and
-///   costs a second scan per validated predicate.
-/// - **Predicate locks / index-range tracking**, as Postgres SSI does with SIREAD
-///   locks on index ranges. Cheaper at commit, considerably more machinery.
-///
-/// Until then this test documents real behaviour rather than desired behaviour.
-/// It will fail loudly if the gap is ever closed — which is the point.
+/// T2 read `value % 3 = 0` and saw nothing. By the time T2 commits, T1's row 3
+/// matches. The result set changed, so T2 cannot be serialized.
 #[test]
-fn g2_predicate_write_skew_is_not_prevented() -> Result<()> {
+fn g2_predicate_write_skew_is_prevented() -> Result<()> {
     let db = setup()?;
     let mut t1 = db.begin_with::<Serializable>();
     let mut t2 = db.begin_with::<Serializable>();
@@ -753,22 +755,67 @@ fn g2_predicate_write_skew_is_not_prevented() -> Result<()> {
     t2.insert(Test { id: 4, value: 42 })?;
 
     t1.commit()?;
-    let t2_outcome = t2.commit();
+    let err = t2
+        .commit()
+        .expect_err("T1's insert became a phantom in T2's predicate");
+    assert!(matches!(err, Error::SerializationFailure), "{err}");
 
-    assert!(
-        t2_outcome.is_ok(),
-        "G2 is now prevented — good. Update the results matrix in this file's \
-         module docs and turn this test into an `expect_err`."
-    );
-
-    // Both transactions believed nothing matched `value % 3 == 0`; together they
-    // made two rows match. Neither serial order produces this.
+    // Only T1's row is present, which is the serial outcome T1-then-T2 with T2
+    // rolled back — not the "both believed nothing matched" state.
     let mut check = db.begin();
-    assert_eq!(
-        matching(&mut check, |v| v % 3 == 0)?,
-        vec![(3, 30), (4, 42)],
-        "the anomaly this test documents"
-    );
+    assert_eq!(matching(&mut check, |v| v % 3 == 0)?, vec![(3, 30)]);
+    Ok(())
+}
+
+/// The complement, and the reason predicates are recorded rather than whole
+/// tables: an insert that does **not** satisfy the predicate must not abort
+/// anyone.
+///
+/// Without this, "prevent G2" could be achieved trivially and uselessly by
+/// aborting on any concurrent insert at all.
+#[test]
+fn g2_prevention_does_not_abort_on_irrelevant_inserts() -> Result<()> {
+    let db = setup()?;
+    let mut t1 = db.begin_with::<Serializable>();
+    let mut t2 = db.begin_with::<Serializable>();
+
+    assert!(matching(&mut t1, |v| v % 3 == 0)?.is_empty());
+    assert!(matching(&mut t2, |v| v % 3 == 0)?.is_empty());
+
+    // 31 and 32 are not multiples of 3: outside both predicates.
+    t1.insert(Test { id: 3, value: 31 })?;
+    t2.insert(Test { id: 4, value: 32 })?;
+
+    t1.commit()?;
+    t2.commit()?;
+
+    let mut check = db.begin();
+    assert!(matching(&mut check, |v| v % 3 == 0)?.is_empty());
+    Ok(())
+}
+
+/// A filter applied *after* `scan` is not a predicate the engine can see, so it
+/// falls back to "I read the whole table" — sound, but it aborts on any
+/// concurrent write anywhere in the table.
+///
+/// Documented as a test because it is the performance trap in this API.
+#[test]
+fn scan_then_filter_is_sound_but_far_more_likely_to_abort() -> Result<()> {
+    let db = setup()?;
+    let mut t1 = db.begin_with::<Serializable>();
+    let mut t2 = db.begin_with::<Serializable>();
+
+    // The filter never reaches the engine; both see "the whole table".
+    let _ = t1.scan::<Test>()?.iter().filter(|r| r.value % 3 == 0).count();
+    let _ = t2.scan::<Test>()?.iter().filter(|r| r.value % 3 == 0).count();
+
+    // Inserts that match nobody's predicate.
+    t1.insert(Test { id: 3, value: 31 })?;
+    t2.insert(Test { id: 4, value: 32 })?;
+
+    t1.commit()?;
+    let err = t2.commit().expect_err("the whole-table read set is invalidated");
+    assert!(matches!(err, Error::SerializationFailure), "{err}");
     Ok(())
 }
 
