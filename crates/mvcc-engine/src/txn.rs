@@ -10,13 +10,15 @@ use mvcc_core::{
     Encodable, Error, IndexKey, IsolationLevel, Result, Timestamp, TxnId, Versioned, Visibility,
 };
 
+use crossbeam_epoch::{Guard, Owned, Shared};
+
 use crate::ssi::TxnState;
 use crate::store::{Database, Slot, Table, Version};
 
 /// A write this transaction has installed but not yet committed.
 ///
 /// Type-erased so one `Transaction` can hold writes to many different tables.
-trait WriteOp<'db>: Send + Sync {
+trait WriteOp<'db> {
     /// Stamp the new version visible at `ts` and retire the one it replaced.
     fn commit(&self, ts: Timestamp);
     /// Unlink the new version, restoring the slot to what it was.
@@ -34,39 +36,66 @@ trait WriteOp<'db>: Send + Sync {
 struct SlotWrite<'db, T: Versioned> {
     table: &'db Table<T>,
     slot: &'db Slot<T>,
-    installed: Arc<Version<T>>,
-    /// The version `installed` displaced, whose `end` must be stamped on commit
-    /// and which the slot is restored to on abort.
-    replaced: Option<Arc<Version<T>>>,
+    /// The version installed, and the one it displaced.
+    ///
+    /// Raw pointers rather than references because the allocations they name are
+    /// kept alive by the *transaction's own pin*, and a struct cannot borrow
+    /// from a sibling field. The invariant that makes dereferencing them sound:
+    /// `Transaction::guard` is declared last, so it is dropped after the write
+    /// set, and every write op is consumed or discarded before that.
+    installed: *const Version<T>,
+    replaced: *const Version<T>,
     txn: TxnId,
 }
 
 impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
     fn commit(&self, ts: Timestamp) {
-        // Order matters. The new version becomes visible only once `begin`
-        // holds a real timestamp, so stamping the old version's `end` first
-        // would briefly leave the record invisible to concurrent readers.
-        if let Some(prev) = &self.replaced {
-            prev.end.store(ts.raw(), Ordering::Release);
+        // SAFETY: both pointers name versions kept alive by this transaction's
+        // pin — see the note on the fields.
+        unsafe {
+            // Order matters. The new version becomes visible only once `begin`
+            // holds a real timestamp, so stamping the old version's `end` first
+            // would briefly leave the record invisible to concurrent readers.
+            if let Some(prev) = self.replaced.as_ref() {
+                prev.end.store(ts.raw(), Ordering::Release);
+            }
+            (*self.installed).begin.store(ts.raw(), Ordering::Release);
         }
-        self.installed.begin.store(ts.raw(), Ordering::Release);
         self.slot.unlock(self.txn);
     }
 
     fn abort(&self) {
-        self.slot.latest.store(self.replaced.clone());
+        // Unlink first, then retire. Between the two the version is unreachable
+        // from the chain but still allocated, which is exactly the window
+        // epoch reclamation exists to cover: a reader that loaded the pointer
+        // before the store keeps dereferencing it safely until its pin ends.
+        let guard = &crossbeam_epoch::pin();
+        self.slot
+            .latest
+            .store(Shared::from(self.replaced), Ordering::Release);
+
+        // SAFETY: `installed` was allocated by this transaction and has just
+        // been unlinked, so no new reader can reach it. `defer_destroy` runs
+        // the drop only once every thread pinned at retirement has unpinned,
+        // which covers readers that loaded the pointer before the store above.
+        unsafe {
+            guard.defer_destroy(Shared::from(self.installed));
+        }
         self.slot.unlock(self.txn);
     }
 
     fn conflicting_readers(&self, txn: TxnId, gc: Timestamp) -> Vec<Arc<TxnState>> {
         let mut readers = self.slot.readers.lock().others(txn, gc);
-        if let Some(value) = self.installed.value.as_ref() {
-            readers.extend(self.table.predicate_readers_of(value, txn, gc));
-        }
-        // A delete makes a row vanish from predicates that matched it, so the
-        // version it replaced has to be checked too.
-        if let Some(previous) = self.replaced.as_ref().and_then(|v| v.value.as_ref()) {
-            readers.extend(self.table.predicate_readers_of(previous, txn, gc));
+        // SAFETY: see the note on the fields.
+        unsafe {
+            if let Some(value) = (*self.installed).value.as_ref() {
+                readers.extend(self.table.predicate_readers_of(value, txn, gc));
+            }
+            // A delete makes a row vanish from predicates that matched it, so
+            // the version it replaced has to be checked too.
+            if let Some(previous) = self.replaced.as_ref().and_then(|v| v.value.as_ref()) {
+                readers.extend(self.table.predicate_readers_of(previous, txn, gc));
+            }
         }
         readers
     }
@@ -83,8 +112,8 @@ impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
 /// fully installed. That is what satisfies Cahill's "the transaction on the
 /// outgoing edge commits first" condition without tracking commit order
 /// separately.
-trait ReadValidation<'db>: Send + Sync {
-    fn revalidate(&self, now: Timestamp) -> Revalidation;
+trait ReadValidation<'db> {
+    fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation;
 }
 
 /// The outcome of re-checking one read at commit.
@@ -119,20 +148,26 @@ impl Revalidation {
     }
 }
 
+/// One point read, recorded for commit-time revalidation.
+///
+/// `observed` is an *address*, not a pointer or a reference, and deliberately
+/// so: revalidation only ever compares it for identity. Storing it as a `usize`
+/// makes "never dereferenced" a property of the type rather than a comment, and
+/// keeps the read set free of anything that could outlive the pin.
 struct SlotRead<'db, T> {
     slot: &'db Slot<T>,
-    observed: Option<Arc<Version<T>>>,
+    observed: Option<usize>,
 }
 
 impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<'db, T> {
-    fn revalidate(&self, now: Timestamp) -> Revalidation {
+    fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation {
         // Read as nobody, so this transaction's own in-flight writes stay
         // invisible. Validating as ourselves would compare what we read against
         // what we then wrote, and every read-modify-write would abort itself.
-        let current = self.slot.read(now, TxnId::NONE);
-        let unchanged = match (&self.observed, &current) {
+        let current = self.slot.read(now, TxnId::NONE, guard);
+        let unchanged = match (self.observed, current) {
             (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (Some(a), Some(b)) => a == b as *const Version<T> as usize,
             _ => false,
         };
         if unchanged {
@@ -156,13 +191,15 @@ impl<'db, T: Send + Sync> ReadValidation<'db> for SlotRead<'db, T> {
 struct PredicateRead<'db, T: Versioned> {
     table: &'db Table<T>,
     predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
-    observed: Vec<(T::Key, Arc<Version<T>>)>,
+    /// Matching keys and the *address* of the version each matched through.
+    /// Identity only — see [`SlotRead`].
+    observed: Vec<(T::Key, usize)>,
 }
 
 impl<'db, T: Versioned> ReadValidation<'db> for PredicateRead<'db, T> {
-    fn revalidate(&self, now: Timestamp) -> Revalidation {
-        let current = self.table.matching(now, TxnId::NONE, &*self.predicate);
-        writers_of_change(self.table, &self.observed, &current, now)
+    fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation {
+        let current = self.table.matching(now, TxnId::NONE, &*self.predicate, guard);
+        writers_of_change(self.table, &self.observed, &current, now, guard)
     }
 }
 
@@ -175,19 +212,20 @@ struct IndexRangeRead<'db, T: Versioned> {
     position: usize,
     lo: Bound<IndexKey>,
     hi: Bound<IndexKey>,
-    observed: Vec<(T::Key, Arc<Version<T>>)>,
+    observed: Vec<(T::Key, usize)>,
 }
 
 impl<'db, T: Versioned> ReadValidation<'db> for IndexRangeRead<'db, T> {
-    fn revalidate(&self, now: Timestamp) -> Revalidation {
+    fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation {
         let current = self.table.matching_in_index(
             self.position,
             self.lo.clone(),
             self.hi.clone(),
             now,
             TxnId::NONE,
+            guard,
         );
-        writers_of_change(self.table, &self.observed, &current, now)
+        writers_of_change(self.table, &self.observed, &current, now, guard)
     }
 }
 
@@ -207,15 +245,17 @@ impl<'db, T: Versioned> ReadValidation<'db> for IndexRangeRead<'db, T> {
 /// test never fires.
 fn writers_of_change<T: Versioned>(
     table: &Table<T>,
-    observed: &[(T::Key, Arc<Version<T>>)],
-    current: &[(T::Key, Arc<Version<T>>)],
+    observed: &[(T::Key, usize)],
+    current: &[(T::Key, &Version<T>)],
     now: Timestamp,
+    guard: &Guard,
 ) -> Revalidation {
+    let addr = |v: &Version<T>| v as *const Version<T> as usize;
     let identical = observed.len() == current.len()
         && observed
             .iter()
             .zip(current)
-            .all(|((ko, vo), (kc, vc))| ko == kc && Arc::ptr_eq(vo, vc));
+            .all(|((ko, vo), (kc, vc))| ko == kc && *vo == addr(vc));
     if identical {
         return Revalidation::unchanged();
     }
@@ -225,7 +265,7 @@ fn writers_of_change<T: Versioned>(
     for (key, version) in current {
         let same_as_observed = observed
             .iter()
-            .any(|(ko, vo)| ko == key && Arc::ptr_eq(vo, version));
+            .any(|(ko, vo)| ko == key && *vo == addr(version));
         if !same_as_observed {
             writers.extend(version.writer.clone());
         }
@@ -236,7 +276,7 @@ fn writers_of_change<T: Versioned>(
             continue;
         }
         if let Some(slot) = table.slot(key)
-            && let Some(version) = slot.read(now, TxnId::NONE)
+            && let Some(version) = slot.read(now, TxnId::NONE, guard)
         {
             writers.extend(version.writer.clone());
         }
@@ -262,6 +302,21 @@ pub struct Transaction<'db, I: IsolationLevel> {
     /// one per transaction at every level meant a `malloc` and `free` on the
     /// hot path for a value nobody would look at.
     state: Option<Arc<TxnState>>,
+    /// Epoch pin, held for the transaction's whole life.
+    ///
+    /// Pinning once here rather than once per read is what makes the reads
+    /// free: inside the pin, following a version chain is plain pointer loads.
+    /// It also gives every version this transaction observes a lifetime — the
+    /// pin's — which is what `Ref<'txn, T>` borrows from.
+    ///
+    /// The cost is the same shape as the GC watermark's: a long-running
+    /// transaction holds an epoch and defers reclamation for everyone. That is
+    /// the failure mode `crate::gc` already documents, now with a second way to
+    /// trigger it.
+    ///
+    /// Declared last so it drops last: the read and write sets hold addresses
+    /// into allocations this pin protects.
+    guard: Guard,
     writes: Vec<Box<dyn WriteOp<'db> + 'db>>,
     /// Empty, and never pushed to, unless `I::VALIDATES_READS`.
     reads: Vec<Box<dyn ReadValidation<'db> + 'db>>,
@@ -296,6 +351,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             table_cache: Vec::new(),
             done: false,
             _level: PhantomData,
+            guard: crossbeam_epoch::pin(),
         }
     }
 
@@ -362,7 +418,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     ///
     /// Returns a guard over the version in place rather than a copy. Reads take
     /// no locks and never block, whatever else is happening to the record.
-    pub fn get<T: Versioned>(&mut self, key: &T::Key) -> Result<Option<Ref<T>>> {
+    pub fn get<T: Versioned>(&mut self, key: &T::Key) -> Result<Option<Ref<'_, T>>> {
         self.ensure_live()?;
         let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
@@ -372,7 +428,11 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // on "this key does not exist" must abort if someone creates it.
             if I::VALIDATES_READS {
                 let slot = table.slot_or_create(key);
-                slot.readers.lock().register(self.ssi());
+                let state = self
+                    .state
+                    .as_ref()
+                    .expect("SSI state is only touched when I::VALIDATES_READS");
+                slot.readers.lock().register(state);
                 self.reads.push(Box::new(SlotRead::<T> {
                     slot,
                     observed: None,
@@ -381,14 +441,18 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return Ok(None);
         };
 
-        let version = slot.read(snapshot, self.id);
+        let version = slot.read(snapshot, self.id, &self.guard);
 
         if I::VALIDATES_READS {
             // SIREAD lock: a later writer of this slot needs to know we read it.
-            slot.readers.lock().register(self.ssi());
+            let state = self
+                .state
+                .as_ref()
+                .expect("SSI state is only touched when I::VALIDATES_READS");
+            slot.readers.lock().register(state);
             self.reads.push(Box::new(SlotRead::<T> {
                 slot,
-                observed: version.clone(),
+                observed: version.map(|v| v as *const Version<T> as usize),
             }));
         }
 
@@ -417,7 +481,11 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        let replaced = slot.latest.load_full();
+        let replaced = {
+            let shared = slot.latest.load(Ordering::Acquire, &self.guard);
+            // SAFETY: reachable from the chain under our pin, so still alive.
+            unsafe { shared.as_ref() }
+        };
 
         // First-updater-wins, part two: someone may have committed and released
         // the lock between our snapshot and now. Writing on top of that version
@@ -438,23 +506,31 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             table.index_record(record);
         }
 
-        let installed = Arc::new(Version {
+        let installed = Owned::new(Version {
             // Tagged as in-flight: invisible to everyone but us until commit
             // overwrites this with a real timestamp.
             begin: std::sync::atomic::AtomicU64::new(self.id.tagged()),
             end: std::sync::atomic::AtomicU64::new(Timestamp::MAX.raw()),
-            prev: replaced.clone(),
+            prev: crossbeam_epoch::Atomic::null(),
             value,
             writer: self.state.clone(),
         });
+        if let Some(prev) = replaced {
+            installed
+                .prev
+                .store(Shared::from(prev as *const Version<T>), Ordering::Relaxed);
+        }
 
-        slot.latest.store(Some(installed.clone()));
+        let installed = installed.into_shared(&self.guard);
+        slot.latest.store(installed, Ordering::Release);
 
         self.writes.push(Box::new(SlotWrite {
             table,
             slot,
-            installed,
-            replaced,
+            installed: installed.as_raw(),
+            replaced: replaced
+                .map(|v| v as *const Version<T>)
+                .unwrap_or(std::ptr::null()),
             txn: self.id,
         }));
         Ok(())
@@ -472,7 +548,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
         if let Some(slot) = table.slot(&key)
             && slot
-                .read(snapshot, self.id)
+                .read(snapshot, self.id, &self.guard)
                 .is_some_and(|v| v.value.is_some())
         {
             return Err(Error::DuplicateKey {
@@ -481,7 +557,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        if let Some(index) = table.unique_violation(&value, snapshot, self.id) {
+        if let Some(index) = table.unique_violation(&value, snapshot, self.id, &self.guard) {
             return Err(Error::DuplicateKey {
                 table: T::TABLE_NAME,
                 index,
@@ -506,7 +582,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let Some(slot) = table.slot(key) else {
             return Ok(false);
         };
-        let Some(version) = slot.read(snapshot, self.id) else {
+        let Some(version) = slot.read(snapshot, self.id, &self.guard) else {
             return Ok(false);
         };
         let Some(current) = version.value.as_ref() else {
@@ -525,7 +601,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        if let Some(index) = table.unique_violation(&next, snapshot, self.id) {
+        if let Some(index) = table.unique_violation(&next, snapshot, self.id, &self.guard) {
             return Err(Error::DuplicateKey {
                 table: T::TABLE_NAME,
                 index,
@@ -550,7 +626,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return Ok(false);
         };
         if slot
-            .read(snapshot, self.id)
+            .read(snapshot, self.id, &self.guard)
             .is_none_or(|v| v.value.is_none())
         {
             return Ok(false);
@@ -567,7 +643,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// part of the read set, so any concurrent insert or update anywhere in it
     /// will abort this transaction. Prefer `scan_where` when you have a
     /// predicate: it is both faster to validate and far less likely to abort.
-    pub fn scan<T: Versioned>(&mut self) -> Result<Vec<Ref<T>>> {
+    pub fn scan<T: Versioned>(&mut self) -> Result<Vec<Ref<'_, T>>> {
         self.scan_where::<T, _>(|_| true)
     }
 
@@ -595,7 +671,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// `predicate` must be `Send + Sync + 'static` because it is retained for
     /// the transaction's lifetime and re-run at commit. It should be pure:
     /// it will be called more than once, and on rows this call never returns.
-    pub fn scan_where<T, P>(&mut self, predicate: P) -> Result<Vec<Ref<T>>>
+    pub fn scan_where<T, P>(&mut self, predicate: P) -> Result<Vec<Ref<'_, T>>>
     where
         T: Versioned,
         P: Fn(&T) -> bool + Send + Sync + 'static,
@@ -605,7 +681,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let snapshot = self.statement_snapshot();
 
         let predicate: Arc<dyn Fn(&T) -> bool + Send + Sync> = Arc::new(predicate);
-        let matched = table.matching(snapshot, self.id, &*predicate);
+        let matched = table.matching(snapshot, self.id, &*predicate, &self.guard);
 
         if I::VALIDATES_READS {
             // Recorded as seen by *nobody*, so this transaction's own
@@ -613,10 +689,17 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             // inserting a row that matches your own predicate would abort you.
             // With nothing written yet the two views coincide, which is the
             // common case and saves a second pass over the table.
-            let observed = if self.writes.is_empty() {
-                matched.clone()
+            let observed: Vec<(T::Key, usize)> = if self.writes.is_empty() {
+                matched
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
+                    .collect()
             } else {
-                table.matching(snapshot, TxnId::NONE, &*predicate)
+                table
+                    .matching(snapshot, TxnId::NONE, &*predicate, &self.guard)
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
+                    .collect()
             };
             // Predicate SIREAD lock: a later insert has to be checked against
             // this predicate, since a row that does not exist yet has no slot
@@ -643,7 +726,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// Under `Serializable` the range is recorded and re-scanned at commit, so
     /// a concurrent insert *into the range* aborts this transaction while one
     /// outside it does not.
-    pub fn scan_index<T, K, R>(&mut self, index: &str, range: R) -> Result<Vec<Ref<T>>>
+    pub fn scan_index<T, K, R>(&mut self, index: &str, range: R) -> Result<Vec<Ref<'_, T>>>
     where
         T: Versioned,
         K: Encodable,
@@ -668,11 +751,14 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let lo = encode_bound(range.start_bound());
         let hi = encode_bound(range.end_bound());
 
-        let matched = table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id);
+        let matched = table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id, &self.guard);
 
         if I::VALIDATES_READS {
-            let observed =
-                table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, TxnId::NONE);
+            let observed: Vec<(T::Key, usize)> = table
+                .matching_in_index(position, lo.clone(), hi.clone(), snapshot, TxnId::NONE, &self.guard)
+                .iter()
+                .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
+                .collect();
 
             // The range is a predicate over the indexed column, so it registers
             // like any other: an insert landing inside the range is a phantom
@@ -745,7 +831,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
         // --- outgoing edges: did anything I read change under me? -----------
         for read in &self.reads {
-            let outcome = read.revalidate(now);
+            let outcome = read.revalidate(now, &self.guard);
             if !outcome.changed {
                 continue;
             }
@@ -903,11 +989,11 @@ impl<'db, I: IsolationLevel> Drop for Transaction<'db, I> {
 ///
 /// Holds the version alive, so it stays valid for as long as you keep it, even
 /// as other transactions overwrite the record.
-pub struct Ref<T> {
-    version: Arc<Version<T>>,
+pub struct Ref<'txn, T> {
+    version: &'txn Version<T>,
 }
 
-impl<T> std::ops::Deref for Ref<T> {
+impl<T> std::ops::Deref for Ref<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -918,13 +1004,13 @@ impl<T> std::ops::Deref for Ref<T> {
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for Ref<T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for Ref<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         (**self).fmt(f)
     }
 }
 
-impl<T: Clone> Ref<T> {
+impl<T: Clone> Ref<'_, T> {
     /// Copy the record out, detaching it from the version chain.
     pub fn to_owned(&self) -> T {
         (**self).clone()

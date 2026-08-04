@@ -9,5 +9,6 @@ repository.workspace = true
 
 [dependencies]
 arc-swap = "1.9.2"
+crossbeam-epoch = "0.9.20"
 mvcc-core.workspace = true
 parking_lot = "0.12.5"

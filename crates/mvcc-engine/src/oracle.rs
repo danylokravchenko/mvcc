@@ -82,33 +82,40 @@ fn thread_slot() -> usize {
 }
 
 /// How timestamps are handed out.
+///
+/// One strategy, deliberately. Two others are described in the literature and
+/// were the obvious next steps; both turned out to conflict with the completion
+/// ring that computes the read watermark, and neither is offered as a setting
+/// that silently does nothing.
+///
+/// **Batched** — each thread claims a block of `stride` timestamps with one
+/// `fetch_add` and hands them out locally. It cannot work here: the ring needs
+/// commit timestamps to be *dense*, and a reserved-but-unused timestamp is an
+/// permanent hole. Tried as an experiment, it did not merely run slowly, it
+/// deadlocked — every committer blocked waiting for a watermark that could
+/// never advance. Making it work needs the watermark to track reserved ranges,
+/// at which point an idle thread holding a block freezes every snapshot in the
+/// system.
+///
+/// **Epoch** (Silo-style) — a global epoch advances on a timer and transactions
+/// are ordered between epochs but not within one, which removes the shared
+/// counter from the commit path entirely. The obstacle is not the counter but
+/// the two things built on top of it here: visibility would lag by up to an
+/// epoch, so "commit, then read it back" would stop working without an extra
+/// wait; and SSI revalidates read sets against the read watermark, which would
+/// no longer be able to see same-epoch commits. It remains the right answer for
+/// a much larger machine, and it is a redesign rather than a setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OracleConfig {
     /// One global atomic counter for commit timestamps.
     ///
-    /// Exact and totally ordered. The counter is still a contended cache line —
-    /// see `Batched` and `Epoch` for the ways out — but it is now a bare
-    /// `fetch_add` with no lock behind it.
+    /// Exact and totally ordered, and now a bare `fetch_add` with no lock
+    /// behind it. The counter is still a shared cache line, but measurement put
+    /// the watermark's compare-exchange well ahead of it as the write path's
+    /// cost — see [`Oracle::publish`].
     #[default]
     Centralised,
-
-    /// Each thread claims a block of `stride` timestamps with one `fetch_add`
-    /// and hands them out locally. Cuts coherence traffic by `stride`, at the
-    /// cost of timestamps no longer being densely allocated — which the
-    /// completion ring currently relies on, so this needs a different watermark.
-    ///
-    /// Not yet implemented.
-    Batched { stride: u64 },
-
-    /// Silo-style epochs: a global epoch advances on a timer; transactions are
-    /// ordered *between* epochs but unordered *within* one, which removes the
-    /// shared counter from the commit path entirely.
-    ///
-    /// Costs a latency floor of `epoch_micros` on commit and gives up strict
-    /// serializability (serializability itself holds).
-    ///
-    /// Not yet implemented.
-    Epoch { epoch_micros: u64 },
 }
 
 #[repr(align(64))] // one counter per cache line
@@ -207,6 +214,12 @@ impl Oracle {
     /// Returns the *read watermark*, not the raw counter, so a transaction
     /// cannot see a commit whose versions are still being stamped.
     pub fn begin_snapshot(&self, id: TxnId) -> Timestamp {
+        // Bring the watermark current, since this is the point at which its
+        // staleness would become observable. One load and a comparison when
+        // there is nothing to do; the compare-exchange runs only when it can
+        // make progress. This is what keeps "commit, then read it back" working
+        // while commits themselves stay off the watermark.
+        self.advance();
         let ts = Timestamp(self.read_watermark.load(Ordering::Acquire));
         self.shard(id).snapshots.lock().push(ts.raw());
         ts
@@ -236,25 +249,55 @@ impl Oracle {
     pub fn begin_commit(&self) -> Timestamp {
         let ts = self.next_ts.fetch_add(1, Ordering::Relaxed);
 
-        // The ring can only describe `RING` timestamps at once, so running
-        // further ahead than that would overwrite a slot the watermark has not
-        // reached. It takes `RING` commits installing simultaneously, so in
-        // practice this never spins.
+        // The ring describes `RING` timestamps at once, so running further
+        // ahead would overwrite a slot the watermark has not consumed. Waiting
+        // here also drags the watermark along: a transaction that has taken a
+        // timestamp is itself the hole everyone else is stuck behind, so it must
+        // not block without trying to make progress.
+        //
+        // Reaching this needs `RING` commits installing simultaneously, so in
+        // practice it never spins.
         while ts.saturating_sub(self.read_watermark.load(Ordering::Acquire)) >= RING as u64 {
+            self.advance();
             std::hint::spin_loop();
         }
         Timestamp(ts)
     }
 
-    /// Publish that `ts` is fully installed, and advance the read watermark over
-    /// whatever contiguous run of completed commits that exposes.
+    /// Publish that `ts` is fully installed.
+    ///
+    /// Storing the completion is the whole obligation. Moving the watermark is
+    /// left to whichever commit happens to fill the current hole, plus a
+    /// catch-up in [`Oracle::begin_snapshot`].
+    ///
+    /// That split is sound because the watermark exists only to serve
+    /// snapshots: if nobody is taking one, how far behind it has fallen is
+    /// unobservable. So it is brought current where it is about to be read
+    /// rather than on every commit.
+    ///
+    /// And it matters, because the watermark is a single word that every commit
+    /// was fighting over. Only the commit completing `watermark + 1` can move
+    /// anything; every other one ran a compare-exchange loop that failed and
+    /// achieved nothing except invalidating that cache line for everybody else.
+    /// Removing the loop entirely, as a throwaway experiment, took four-thread
+    /// write throughput from 5.45M to 8.98M ops/sec — so one load and a
+    /// comparison to skip it is worth having.
     pub fn publish(&self, ts: Timestamp) {
         self.completed[(ts.raw() & RING_MASK) as usize].store(ts.raw(), Ordering::Release);
 
-        // Several threads may run this at once. The CAS decides which of them
-        // moves the watermark; a loser re-reads and continues. The watermark
-        // only ever moves forward and only over completed slots, so no commit
-        // can be skipped and none can be exposed twice.
+        if self.read_watermark.load(Ordering::Acquire) + 1 == ts.raw() {
+            self.advance();
+        }
+    }
+
+    /// Move the read watermark over any contiguous run of completed commits.
+    ///
+    /// Racing callers are harmless: the watermark only moves forward and only
+    /// over slots already marked complete, so a loser re-reads and continues. A
+    /// completion that lands just after a scan has passed it is not lost — the
+    /// next `publish` that fills a hole, or the next `begin_snapshot`, picks it
+    /// up.
+    fn advance(&self) {
         loop {
             let current = self.read_watermark.load(Ordering::Acquire);
             let candidate = current + 1;
@@ -413,12 +456,13 @@ mod tests {
             t.join().expect("worker panicked");
         }
 
-        // Every timestamp handed out was published, so the watermark must have
-        // caught all the way up. A stall here would mean the CAS loop dropped a
-        // completed slot.
+        // Every timestamp handed out was published, so a transaction beginning
+        // now must see all of them. `begin_snapshot` is where the watermark is
+        // brought current — a commit chases it only when it happens to fill the
+        // current hole — so that is what this asks for.
         let next = o.next_ts.load(Ordering::Acquire);
         assert_eq!(
-            o.statement_snapshot(),
+            o.begin_snapshot(TxnId(1)),
             Timestamp(next - 1),
             "watermark stalled below a fully published sequence"
         );

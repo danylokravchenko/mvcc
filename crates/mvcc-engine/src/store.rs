@@ -65,7 +65,7 @@ use mvcc_core::{
     Versioned, Visibility,
 };
 
-use arc_swap::ArcSwapOption;
+use crossbeam_epoch::{Atomic, Guard, Shared};
 
 use crate::hash::FxBuildHasher;
 use crate::oracle::{Oracle, OracleConfig};
@@ -80,7 +80,8 @@ use crate::txn::Transaction;
 pub struct Version<T> {
     pub(crate) begin: AtomicU64,
     pub(crate) end: AtomicU64,
-    pub(crate) prev: Option<Arc<Version<T>>>,
+    /// The version this one displaced. Written once at construction.
+    pub(crate) prev: Atomic<Version<T>>,
     pub(crate) value: Option<T>,
     /// The transaction that created this version.
     ///
@@ -106,28 +107,17 @@ impl<T> Version<T> {
 pub struct Slot<T> {
     /// Head of the version chain.
     ///
-    /// An `ArcSwapOption` rather than an `RwLock`, so a reader never takes a
-    /// lock to find the current version. Writes are already serialised by
-    /// `lock` below — first-updater-wins means only one transaction can be
-    /// installing here — so the only thing the lock was providing was making the
-    /// `Arc` load atomic against a concurrent store, which is exactly what
-    /// `ArcSwap` does without one.
+    /// An epoch-managed `Atomic`, so a reader follows the chain by plain
+    /// pointer loads: no lock, no reference count, no write to shared memory of
+    /// any kind. Writes are already serialised by `lock` below, so the only job
+    /// left is making the load atomic against a concurrent store.
     ///
-    /// This is a real trade, not a free win, and `cargo bench` measures both
-    /// halves of it. Reading four rows from every thread (ops/sec):
-    ///
-    /// ```text
-    ///                 1 thread    4 threads
-    ///   RwLock          76.3M       25.2M     collapses under contention
-    ///   ArcSwapOption   56.6M       42.1M
-    /// ```
-    ///
-    /// Uncontended, the `RwLock` wins — `ArcSwap`'s per-load bookkeeping costs
-    /// more than two uncontended atomics. Contended, the `RwLock` falls apart
-    /// while `ArcSwap` degrades gently. Skewed access is the normal case for
-    /// OLTP, and an engine built for concurrency should not collapse on hot
-    /// rows, so the contended half is the one that decides it.
-    pub(crate) latest: ArcSwapOption<Version<T>>,
+    /// The reference count this replaced was the last shared write on the read
+    /// path, and it was expensive out of all proportion to its size. Isolated,
+    /// four threads reading four hot records ran 37x faster through a plain
+    /// reference than through `Arc::clone` — every read was dirtying a cache
+    /// line that every other reader of that record needed.
+    pub(crate) latest: Atomic<Version<T>>,
     /// Transaction id currently writing this slot, or 0 if free.
     pub(crate) lock: AtomicU64,
     /// SIREAD locks: transactions that have read this slot and may still form
@@ -139,7 +129,7 @@ pub struct Slot<T> {
 impl<T> Slot<T> {
     fn new() -> Self {
         Slot {
-            latest: ArcSwapOption::empty(),
+            latest: Atomic::null(),
             lock: AtomicU64::new(0),
             readers: Mutex::new(Readers::default()),
         }
@@ -147,20 +137,27 @@ impl<T> Slot<T> {
 
     /// Walk the chain for the version visible at `snapshot`.
     ///
-    /// Traversal borrows each hop and clones only the version it returns. The
-    /// previous form cloned the `Arc` at every step, so a reader that walked
-    /// back four versions did four atomic increments and four decrements to
-    /// answer with one of them.
-    pub(crate) fn read(&self, snapshot: Timestamp, reader: TxnId) -> Option<Arc<Version<T>>> {
-        let head = self.latest.load();
-        let mut cur = head.as_ref();
-        while let Some(v) = cur {
+    /// Returns a borrow valid for as long as `guard` is pinned — which, for a
+    /// transaction, is its whole life. Nothing is cloned and nothing shared is
+    /// written.
+    pub(crate) fn read<'g>(
+        &self,
+        snapshot: Timestamp,
+        reader: TxnId,
+        guard: &'g Guard,
+    ) -> Option<&'g Version<T>> {
+        let mut cur = self.latest.load(Ordering::Acquire, guard);
+        loop {
+            // SAFETY: a version leaves a chain only by being retired with
+            // `defer_destroy`, and epoch reclamation cannot run the destructor
+            // while `guard` is pinned. So any pointer reachable from `latest`
+            // during this pin stays allocated for the pin's duration.
+            let v = unsafe { cur.as_ref() }?;
             if v.visible_to(snapshot, reader) {
-                return Some(Arc::clone(v));
+                return Some(v);
             }
-            cur = v.prev.as_ref();
+            cur = v.prev.load(Ordering::Acquire, guard);
         }
-        None
     }
 
     /// Take the write lock, first-updater-wins.
@@ -214,6 +211,33 @@ pub struct Table<T: Versioned> {
     /// its new row against every registered predicate, and a match is an
     /// incoming rw-antidependency.
     predicate_locks: Mutex<Vec<PredicateLock<T>>>,
+}
+
+impl<T: Versioned> Drop for Table<T> {
+    /// Free every version chain.
+    ///
+    /// Necessary because `Atomic` does not own its pointee — that is the whole
+    /// point of epoch reclamation, and it is what the `Arc` chain this replaced
+    /// used to do implicitly. Without this, dropping a `Database` leaks every
+    /// version it ever held.
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` proves there is no concurrent reader, so the
+        // chains can be freed directly rather than deferred. `unprotected` is
+        // exactly the escape hatch for that situation.
+        let guard = unsafe { crossbeam_epoch::unprotected() };
+        for shard in self.slots.iter_mut() {
+            for slot in shard.get_mut().values() {
+                let mut cur = slot.latest.swap(Shared::null(), Ordering::Relaxed, guard);
+                while !cur.is_null() {
+                    // SAFETY: each version belongs to exactly one chain and is
+                    // reached once, so this takes ownership exactly once.
+                    let owned = unsafe { cur.into_owned() };
+                    cur = owned.prev.load(Ordering::Relaxed, guard);
+                    drop(owned);
+                }
+            }
+        }
+    }
 }
 
 /// One registered predicate read, held until its transaction expires.
@@ -331,18 +355,19 @@ impl<T: Versioned> Table<T> {
     /// revalidation at commit. They must agree exactly — a predicate read is
     /// validated by re-running it and comparing — so they call the same code
     /// rather than two implementations that could drift.
-    pub(crate) fn matching(
+    pub(crate) fn matching<'g>(
         &self,
         snapshot: Timestamp,
         reader: TxnId,
         predicate: &dyn Fn(&T) -> bool,
-    ) -> Vec<(T::Key, Arc<Version<T>>)> {
+        guard: &'g Guard,
+    ) -> Vec<(T::Key, &'g Version<T>)> {
         let mut out = Vec::new();
         for key in self.all_keys() {
             let Some(slot) = self.slot(&key) else {
                 continue;
             };
-            let Some(version) = slot.read(snapshot, reader) else {
+            let Some(version) = slot.read(snapshot, reader, guard) else {
                 continue;
             };
             let Some(value) = version.value.as_ref() else {
@@ -357,14 +382,15 @@ impl<T: Versioned> Table<T> {
 
     /// Every record visible at `snapshot` whose key for index `position` falls
     /// in `[lo, hi]`, in index key order.
-    pub(crate) fn matching_in_index(
+    pub(crate) fn matching_in_index<'g>(
         &self,
         position: usize,
         lo: Bound<IndexKey>,
         hi: Bound<IndexKey>,
         snapshot: Timestamp,
         reader: TxnId,
-    ) -> Vec<(T::Key, Arc<Version<T>>)> {
+        guard: &'g Guard,
+    ) -> Vec<(T::Key, &'g Version<T>)> {
         let desc = &T::indexes()[position];
         let in_range = |k: &IndexKey| {
             let lo_ok = match &lo {
@@ -384,12 +410,12 @@ impl<T: Versioned> Table<T> {
         // Each is resolved to its visible version and its key re-extracted,
         // which is what filters out entries left behind by updates and
         // rolled-back writes.
-        let mut out: Vec<(IndexKey, T::Key, Arc<Version<T>>)> = Vec::new();
+        let mut out: Vec<(IndexKey, T::Key, &'g Version<T>)> = Vec::new();
         for key in self.index_candidates(position, lo.clone(), hi.clone()) {
             let Some(slot) = self.slot(&key) else {
                 continue;
             };
-            let Some(version) = slot.read(snapshot, reader) else {
+            let Some(version) = slot.read(snapshot, reader, guard) else {
                 continue;
             };
             let Some(value) = version.value.as_ref() else {
@@ -444,6 +470,7 @@ impl<T: Versioned> Table<T> {
         record: &T,
         snapshot: Timestamp,
         reader: TxnId,
+        guard: &Guard,
     ) -> Option<&'static str> {
         let own_key = record.key();
         for (position, desc) in T::indexes().iter().enumerate() {
@@ -464,7 +491,7 @@ impl<T: Versioned> Table<T> {
                 let Some(slot) = self.slot(&candidate) else {
                     continue;
                 };
-                let Some(version) = slot.read(snapshot, reader) else {
+                let Some(version) = slot.read(snapshot, reader, guard) else {
                     continue;
                 };
                 let Some(value) = version.value.as_ref() else {

@@ -445,3 +445,69 @@ fn fields_may_be_any_type_the_struct_itself_supports() -> Result<()> {
     assert!(session.started.elapsed().as_secs() < 60);
     Ok(())
 }
+
+/// Dropping a `Database` must free every version, not just the live ones.
+///
+/// Regression guard for the epoch-reclamation conversion. The version chain
+/// used to be `Arc`-linked, so dropping a slot freed the whole chain for free.
+/// An epoch-managed `Atomic` deliberately does *not* own its pointee — that is
+/// what lets readers traverse without touching a refcount — so the chains have
+/// to be freed explicitly. Miss it and every database ever opened leaks every
+/// row it ever held, silently.
+#[test]
+fn dropping_a_database_frees_every_version() -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct Tracked(Arc<AtomicUsize>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Mvcc, Clone, Debug)]
+    #[mvcc(table = "tracked")]
+    struct Row {
+        #[mvcc(primary_key)]
+        id: u64,
+        payload: Tracked,
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+
+    {
+        let db = Database::open(Config::in_memory())?;
+        db.register::<Row>()?;
+
+        // 100 rows, each updated twice, so each key carries a three-version
+        // chain and only the head is reachable by a reader.
+        db.transaction(|tx| {
+            for id in 0..100 {
+                tx.insert(Row { id, payload: Tracked(Arc::clone(&drops)) })?;
+            }
+            Ok(())
+        })?;
+        for _ in 0..2 {
+            db.transaction(|tx| {
+                for id in 0..100 {
+                    tx.update::<Row>(&id, |r| r.payload = Tracked(Arc::clone(&drops)))?;
+                }
+                Ok(())
+            })?;
+        }
+
+        drops.store(0, Ordering::Relaxed);
+    } // `db` dropped here
+
+    // 300 versions: 100 keys x 3 versions each. Every one must be freed, not
+    // just the 100 still at the head of their chain.
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        300,
+        "versions leaked when the database was dropped"
+    );
+    Ok(())
+}
