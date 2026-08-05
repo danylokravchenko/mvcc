@@ -505,7 +505,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         }
 
         if let Some(record) = &value {
-            table.index_record(record);
+            table.index_record(record, replaced.and_then(|v| v.value.as_ref()));
         }
 
         let installed = Owned::new(Version {
@@ -683,26 +683,19 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let snapshot = self.statement_snapshot();
 
         let predicate: Arc<dyn Fn(&T) -> bool + Send + Sync> = Arc::new(predicate);
-        let matched = table.matching(snapshot, self.id, &*predicate, &self.guard);
 
-        if I::VALIDATES_READS {
-            // Recorded as seen by *nobody*, so this transaction's own
-            // uncommitted writes stay out of its own read set — otherwise
+        let matched = if I::VALIDATES_READS {
+            // The read set is recorded as seen by *nobody*, so this
+            // transaction's own uncommitted writes stay out of it — otherwise
             // inserting a row that matches your own predicate would abort you.
-            // With nothing written yet the two views coincide, which is the
-            // common case and saves a second pass over the table.
-            let observed: Vec<(T::Key, usize)> = if self.writes.is_empty() {
-                matched
-                    .iter()
-                    .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
-                    .collect()
-            } else {
-                table
-                    .matching(snapshot, TxnId::NONE, &*predicate, &self.guard)
-                    .iter()
-                    .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
-                    .collect()
-            };
+            // `matching_pair` produces that view alongside the caller's from a
+            // single table pass; they differ only on rows written here.
+            let (matched, committed) =
+                table.matching_pair(snapshot, self.id, &*predicate, &self.guard);
+            let observed: Vec<(T::Key, usize)> = committed
+                .iter()
+                .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
+                .collect();
             // Predicate SIREAD lock: a later insert has to be checked against
             // this predicate, since a row that does not exist yet has no slot
             // to register on. This is what makes phantoms detectable.
@@ -712,7 +705,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
                 predicate,
                 observed,
             }));
-        }
+            matched
+        } else {
+            table.matching(snapshot, self.id, &*predicate, &self.guard)
+        };
 
         Ok(matched
             .into_iter()

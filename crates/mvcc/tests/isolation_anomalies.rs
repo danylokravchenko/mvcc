@@ -404,6 +404,53 @@ fn secondary_index_scans_respect_visibility() -> Result<()> {
 }
 
 #[test]
+fn index_entries_survive_updates_that_leave_the_key_alone() -> Result<()> {
+    // Index maintenance skips any index whose key is unchanged from the version
+    // being displaced, on the grounds that the entry is already there from the
+    // write that first set it and nothing ever removes one.
+    //
+    // Worth a test of its own because the failure mode is silent: a row that
+    // lost its own index entry does not error, it just stops being returned by
+    // scans that should find it, which looks exactly like the visibility
+    // recheck doing its job.
+    let red = || "red".to_string()..="red".to_string();
+    let db = db_with(&[(1, "red", 1), (2, "red", 2)])?;
+
+    // An update touching only a non-indexed field takes the skip path.
+    db.transaction(|tx| tx.update::<Item>(&1, |i| i.value += 10).map(|_| ()))?;
+    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+
+    // Repeatedly, so a stale entry cannot be masked by one fresh insert.
+    for _ in 0..3 {
+        db.transaction(|tx| tx.update::<Item>(&2, |i| i.value += 1).map(|_| ()))?;
+    }
+    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+
+    // Out of the group and back: the return write does *not* skip, because the
+    // version it displaces has key "green".
+    db.transaction(|tx| {
+        tx.update::<Item>(&2, |i| i.tag = "green".into())
+            .map(|_| ())
+    })?;
+    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 1);
+    db.transaction(|tx| tx.update::<Item>(&2, |i| i.tag = "red".into()).map(|_| ()))?;
+    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+
+    // A delete installs a tombstone, so the write after it sees no previous
+    // value and re-indexes rather than skipping.
+    db.transaction(|tx| tx.delete::<Item>(&1).map(|_| ()))?;
+    db.transaction(|tx| {
+        tx.insert(Item {
+            id: 1,
+            tag: "red".into(),
+            value: 1,
+        })
+    })?;
+    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn updating_the_primary_key_is_rejected() -> Result<()> {
     let db = db_with(&[(1, "a", 10)])?;
     let mut tx = db.begin();

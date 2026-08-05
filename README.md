@@ -396,7 +396,7 @@ Two things worth knowing when reading any number here:
 
 ## Status
 
-Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, predicate reads, epoch-based reclamation.
+Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, epoch-based reclamation.
 
 The examples are the fastest way in, and each one ends by asserting the world it
 built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is the end-to-end tour: two heroes reaching for the same sword (write conflict), a hero overloading herself (write skew, and the fix), a party filling up (a phantom), an atomic trade, a long report reading while the world moves, and a four-thread raid.
@@ -405,8 +405,6 @@ Not implemented, in rough order of how much they would change things:
 
 - **Durability.** No log, no recovery. See [Scope](#scope).
 - **Larger-than-memory.** The dataset must fit in RAM.
-- **Range scans over an ordered index structure.** The primary map is a sharded
-  hash map; ordered traversal needs an ART, which is the next structural step.
 - **A distributed anything.** One process, one machine.
 
 ## License

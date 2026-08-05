@@ -160,6 +160,46 @@ impl<T> Slot<T> {
         }
     }
 
+    /// The versions visible at `snapshot` to `reader` and to *nobody*, from a
+    /// single descent.
+    ///
+    /// `Serializable` needs both on every predicate read: the first is what the
+    /// caller gets back, the second is what goes into the read set — recorded
+    /// as seen by nobody so a transaction's own uncommitted writes stay out of
+    /// its own read set, or every read-modify-write would abort itself.
+    ///
+    /// One walk suffices because the second answer can only ever sit at or
+    /// below the first in the chain. `Visibility::reached` for a real reader is
+    /// a superset of `reached` for nobody — an in-flight version counts only
+    /// for its own author — so the versions the two disagree about are exactly
+    /// the ones `reader` wrote, and those are nearer the head than the
+    /// committed versions they displaced.
+    pub(crate) fn read_pair<'g>(
+        &self,
+        snapshot: Timestamp,
+        reader: TxnId,
+        guard: &'g Guard,
+    ) -> (Option<&'g Version<T>>, Option<&'g Version<T>>) {
+        let mut seen = None;
+        let mut cur = self.latest.load(Ordering::Acquire, guard);
+        loop {
+            // SAFETY: as in `Slot::read`.
+            let Some(v) = (unsafe { cur.as_ref() }) else {
+                return (seen, None);
+            };
+            if seen.is_none() && v.visible_to(snapshot, reader) {
+                seen = Some(v);
+            }
+            if v.visible_to(snapshot, TxnId::NONE) {
+                // `seen` is necessarily set by now: a version visible to nobody
+                // but not to `reader` must have been ended by `reader`, which
+                // means `reader` installed a newer one, which is visible to it.
+                return (seen, Some(v));
+            }
+            cur = v.prev.load(Ordering::Acquire, guard);
+        }
+    }
+
     /// Take the write lock, first-updater-wins.
     ///
     /// Returns `false` if another transaction holds it. We abort rather than
@@ -189,6 +229,10 @@ impl<T> Slot<T> {
 const SLOT_SHARDS: usize = 64;
 
 type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>, FxBuildHasher>>;
+
+/// Rows a scan returned: primary key and the version it matched through, in
+/// primary key order. Borrowed from the caller's epoch pin, never cloned.
+type Matches<'g, T> = Vec<(<T as Versioned>::Key, &'g Version<T>)>;
 
 pub(crate) struct Table<T: Versioned> {
     /// Primary key to slot, sharded by key hash. See [`SLOT_SHARDS`].
@@ -301,11 +345,25 @@ impl<T: Versioned> Table<T> {
         unsafe { &*(slot as *const Slot<T>) }
     }
 
-    /// Record `record`'s index keys as candidates.
-    pub(crate) fn index_record(&self, record: &T) {
+    /// Record `record`'s index keys as candidates, skipping any index whose key
+    /// is unchanged from `previous` — the version this write displaces, or
+    /// `None` for an insert.
+    ///
+    /// Safe to skip because index maintenance is append-only (see
+    /// [`Table::secondary`]): an unchanged key's entry is already there from
+    /// the write that first set it, and nothing ever removes one. What it buys
+    /// is the lock. Without the check, every write to a table takes the
+    /// *exclusive* lock on every one of its secondary indexes, whether or not
+    /// the indexed column was touched — which is what actually made the module
+    /// header's "an update touches only the indexes whose key actually changed"
+    /// true of the slot address but not of the index maps.
+    pub(crate) fn index_record(&self, record: &T, previous: Option<&T>) {
         let key = record.key();
         for (desc, map) in T::indexes().iter().zip(&self.secondary) {
             let index_key = (desc.extract)(record);
+            if previous.is_some_and(|prev| (desc.extract)(prev) == index_key) {
+                continue;
+            }
             map.write()
                 .entry(index_key)
                 .or_default()
@@ -331,15 +389,44 @@ impl<T: Versioned> Table<T> {
             .collect()
     }
 
-    /// Every primary key, for a full scan.
-    pub(crate) fn all_keys(&self) -> Vec<T::Key> {
-        let mut keys: Vec<_> = self
-            .slots
-            .iter()
-            .flat_map(|shard| shard.read().keys().cloned().collect::<Vec<_>>())
-            .collect();
-        keys.sort();
-        keys
+    /// Visit every slot in the table, taking each shard lock exactly once.
+    ///
+    /// The slot borrows deliberately outlive the shard guard. The alternative —
+    /// collect the keys under the lock, then look each one up again — costs a
+    /// key clone, a hash and a second lock acquisition *per row*, and a scan is
+    /// the one operation that pays those on every row in the table rather than
+    /// on one.
+    ///
+    /// `f` runs with no lock held, so a user predicate cannot block writers to
+    /// a shard and the module invariant that no user code runs under an engine
+    /// lock survives.
+    ///
+    /// # Safety
+    ///
+    /// The same argument as [`Table::slot`]: the slot map is append-only, so
+    /// the `Arc` owning each `Slot` lives as long as the table, and the `Slot`
+    /// is on the heap and never moves — rehashing moves the `Arc`, not its
+    /// referent.
+    ///
+    /// It does **not** extend to the map's keys, which are stored inline and do
+    /// move on rehash. That is why callers recover the primary key from the
+    /// record via [`Versioned::key`] rather than borrowing it from the map —
+    /// which is also why they pay for a key clone per *match* instead of per
+    /// row.
+    fn visit_slots<'s>(&'s self, mut f: impl FnMut(&'s Slot<T>)) {
+        let mut batch: Vec<&'s Slot<T>> = Vec::new();
+        for shard in &self.slots {
+            {
+                let shard = shard.read();
+                batch.extend(shard.values().map(|slot| {
+                    // SAFETY: see the doc comment above.
+                    unsafe { &*Arc::as_ptr(slot) }
+                }));
+            }
+            for slot in batch.drain(..) {
+                f(slot);
+            }
+        }
     }
 
     /// Every record visible at `snapshot` that satisfies `predicate`, in
@@ -355,23 +442,69 @@ impl<T: Versioned> Table<T> {
         reader: TxnId,
         predicate: &dyn Fn(&T) -> bool,
         guard: &'g Guard,
-    ) -> Vec<(T::Key, &'g Version<T>)> {
+    ) -> Matches<'g, T> {
         let mut out = Vec::new();
-        for key in self.all_keys() {
-            let Some(slot) = self.slot(&key) else {
-                continue;
-            };
-            let Some(version) = slot.read(snapshot, reader, guard) else {
-                continue;
-            };
-            let Some(value) = version.value.as_ref() else {
-                continue;
-            };
-            if predicate(value) {
-                out.push((key, version));
+        self.visit_slots(|slot| {
+            if let Some(version) = slot.read(snapshot, reader, guard)
+                && let Some(value) = version.value.as_ref()
+                && predicate(value)
+            {
+                out.push((value.key(), version));
             }
-        }
+        });
+        // Sorting the matches rather than the whole key space is the point of
+        // deriving keys from records: a selective predicate sorts a handful of
+        // rows where collecting keys up front sorted every row in the table.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// [`Table::matching`] as `reader` sees it *and* as nobody sees it, from
+    /// one pass over the table.
+    ///
+    /// `Serializable` needs both — see [`Slot::read_pair`] for which is which
+    /// and why one chain descent answers both. Calling `matching` twice would
+    /// be two full table passes for a difference confined to the rows `reader`
+    /// itself wrote.
+    pub(crate) fn matching_pair<'g>(
+        &self,
+        snapshot: Timestamp,
+        reader: TxnId,
+        predicate: &dyn Fn(&T) -> bool,
+        guard: &'g Guard,
+    ) -> (Matches<'g, T>, Matches<'g, T>) {
+        let mut seen = Vec::new();
+        let mut committed = Vec::new();
+        self.visit_slots(|slot| {
+            let (a, b) = slot.read_pair(snapshot, reader, guard);
+            let same = match (a, b) {
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            if let Some(version) = a
+                && let Some(value) = version.value.as_ref()
+                && predicate(value)
+            {
+                let key = value.key();
+                if same {
+                    committed.push((key.clone(), version));
+                }
+                seen.push((key, version));
+            }
+            // Only reachable for a row `reader` has written, so the second
+            // predicate evaluation is paid on those rows alone.
+            if !same
+                && let Some(version) = b
+                && let Some(value) = version.value.as_ref()
+                && predicate(value)
+            {
+                committed.push((value.key(), version));
+            }
+        });
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        committed.sort_by(|a, b| a.0.cmp(&b.0));
+        (seen, committed)
     }
 
     /// Every record visible at `snapshot` whose key for index `position` falls
@@ -384,7 +517,7 @@ impl<T: Versioned> Table<T> {
         snapshot: Timestamp,
         reader: TxnId,
         guard: &'g Guard,
-    ) -> Vec<(T::Key, &'g Version<T>)> {
+    ) -> Matches<'g, T> {
         let desc = &T::indexes()[position];
         let in_range = |k: &IndexKey| {
             let lo_ok = match lo {

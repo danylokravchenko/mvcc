@@ -17,6 +17,14 @@
 //!   first row is the `Oracle`'s per-transaction cost.
 //! - **write txns** — adds the global commit lock and the rest of the commit
 //!   path.
+//! - **predicate scans** — the only workloads that visit every slot, so the
+//!   only ones where `Table::matching`'s per-row costs are visible at all. Run
+//!   at two selectivities because they stress different halves: 1% is dominated
+//!   by *visiting* rows, 100% by *returning* them.
+//! - **update+scan (serializable)** — the same scan in the shape that pays full
+//!   price: a pending write forces the read set to be built from a separate
+//!   view, and commit re-runs the predicate. Read-only transactions skip
+//!   validation entirely, so the write is what makes this row measure it.
 //!
 //! Reading the two *differences* rather than the three absolutes is the point:
 //! that is what localised the `parking_lot` win to the oracle (see
@@ -137,6 +145,50 @@ fn main() -> Result<()> {
         1
     });
     ssi_writes.report("write txns (serializable)");
+
+    // Predicate scans. These are the only workloads that visit every slot in
+    // the table, so they are where `Table::matching`'s per-row costs show up at
+    // all — the point-read rows above touch exactly one slot and hide them.
+    //
+    // Selective and unselective are separated because they stress different
+    // halves: the 1% variant is dominated by the cost of *visiting* rows, the
+    // 100% variant adds the cost of *returning* them. A change that only helps
+    // one of the two will show up as exactly that.
+    let scan_selective = sample(threads, &db, |db, _| {
+        let mut tx = db.begin_with::<Snapshot>();
+        tx.scan_where::<Row, _>(|r| r.id.is_multiple_of(100))
+            .expect("scan");
+        1
+    });
+    scan_selective.report("scan_where 1% (snapshot)");
+
+    let scan_all = sample(threads, &db, |db, _| {
+        let mut tx = db.begin_with::<Snapshot>();
+        tx.scan_where::<Row, _>(|_| true).expect("scan");
+        1
+    });
+    scan_all.report("scan_where 100% (snapshot)");
+
+    // The same selective scan at `Serializable`, in the shape that actually
+    // pays for it: **write first, then scan**.
+    //
+    // Both halves of that matter. A read-only transaction skips validation
+    // entirely (see `Transaction::commit`), so without the update this row
+    // would measure SIREAD registration and nothing else. And with a write
+    // already pending, `scan_where` cannot reuse its result as the observed
+    // set — it has to scan a second time as nobody — so this is the worst case
+    // for a predicate read, at three table passes: two here, one at commit.
+    let scan_ssi = sample(threads, &db, |db, rng| {
+        let key = rng() % ROWS;
+        db.transaction_with::<Serializable, _, _>(|tx| {
+            tx.update::<Row>(&key, |r| r.value += 1)?;
+            tx.scan_where::<Row, _>(|r| r.id.is_multiple_of(100))?;
+            Ok(())
+        })
+        .expect("scan+update");
+        1
+    });
+    scan_ssi.report("update+scan 1% (serializable)");
 
     // Per-transaction costs, derived from the differences. A value at or below
     // zero means the two workloads are within noise of each other.
