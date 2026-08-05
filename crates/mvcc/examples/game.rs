@@ -91,7 +91,7 @@ fn inventory<I: mvcc::IsolationLevel>(
     hero: u64,
 ) -> Result<Vec<(u64, String, i32)>> {
     Ok(tx
-        .scan_index::<Item, _, _>("owner", hero..=hero)?
+        .scan_index(Item::OWNER, hero..=hero)?
         .iter()
         .map(|i| (i.id, i.name.clone(), i.weight))
         .collect())
@@ -101,7 +101,7 @@ fn inventory<I: mvcc::IsolationLevel>(
 /// `Serializable` it is *this* that a concurrent pickup invalidates.
 fn carried<I: mvcc::IsolationLevel>(tx: &mut mvcc::Transaction<'_, I>, hero: u64) -> Result<i32> {
     Ok(tx
-        .scan_index::<Item, _, _>("owner", hero..=hero)?
+        .scan_index(Item::OWNER, hero..=hero)?
         .iter()
         .map(|i| i.weight)
         .sum())
@@ -600,7 +600,7 @@ fn main() -> Result<()> {
     );
     let mut tx = db.begin();
     for (id, name, gold) in &roster {
-        let held = tx.scan_index::<Item, _, _>("owner", *id..=*id)?;
+        let held = tx.scan_index(Item::OWNER, *id..=*id)?;
         let load: i32 = held.iter().map(|i| i.weight).sum();
         let worth: i64 = held.iter().map(|i| i.value).sum();
         let names: Vec<String> = held

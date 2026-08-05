@@ -21,6 +21,11 @@
 //! - a private `static` holding the index descriptors, const-constructed with
 //!   `extract` as a plain `fn` pointer.
 //! - a private `static OnceLock<TableId>`, filled by `Database::register`.
+//! - `Account::OWNER: Index<Account, String>` — one associated const per
+//!   indexed field, named after the field in upper case, which is how scans
+//!   name an index. Carrying the field's type is the point: it is what makes
+//!   `tx.scan_index(Account::OWNER, 1u64..=2)` a type error rather than a scan
+//!   that matches nothing.
 //!
 //! Everything is emitted inside a `const _: () = { … };` block so the generated
 //! statics cannot collide with user items or with a second derive in the same
@@ -37,11 +42,14 @@
 //!
 //! | attribute | position | meaning |
 //! |---|---|---|
-//! | `table = "name"` | struct | table name; defaults to the type name |
+//! | `table = "name"` | struct | table name, used only in error messages; defaults to the type name |
 //! | `primary_key` | field | required, exactly one |
 //! | `index` | field | secondary index on this field |
 //! | `index(unique)` | field | unique secondary index |
-//! | `index(name = "…")` | field | override the index name |
+//!
+//! An index is always named after its field. There is no rename knob: the name
+//! is not a string anyone types, it is the associated const above, so renaming
+//! it would only decouple the const from the field it reads.
 //!
 //! There is no `skip`: nothing is serialised, so every field is simply carried
 //! along in the struct. Fields need no traits beyond what `Versioned` requires
@@ -69,7 +77,6 @@ struct FieldOpts {
     primary_key: bool,
     index: bool,
     unique: bool,
-    index_name: Option<String>,
 }
 
 fn parse_field_opts(field: &Field) -> syn::Result<FieldOpts> {
@@ -81,23 +88,19 @@ fn parse_field_opts(field: &Field) -> syn::Result<FieldOpts> {
                 opts.primary_key = true;
             } else if meta.path.is_ident("index") {
                 opts.index = true;
-                // `index` may be bare or carry `(unique)` / `(name = "…")`.
+                // `index` may be bare or carry `(unique)`.
                 if meta.input.peek(syn::token::Paren) {
                     meta.parse_nested_meta(|inner| {
                         if inner.path.is_ident("unique") {
                             opts.unique = true;
-                        } else if inner.path.is_ident("name") {
-                            opts.index_name = Some(inner.value()?.parse::<LitStr>()?.value());
+                            Ok(())
                         } else {
-                            return Err(inner.error("expected `unique` or `name = \"…\"`"));
+                            Err(inner.error("expected `unique`"))
                         }
-                        Ok(())
                     })?;
                 }
             } else {
-                return Err(meta.error(
-                    "expected `primary_key`, `index`, `index(unique)`, or `index(name = \"…\")`",
-                ));
+                return Err(meta.error("expected `primary_key`, `index`, or `index(unique)`"));
             }
             Ok(())
         })?;
@@ -143,7 +146,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let mut primary: Option<(Ident, Type)> = None;
-    let mut indexes: Vec<(String, Ident, bool)> = Vec::new();
+    let mut indexes: Vec<(Ident, Type, bool)> = Vec::new();
 
     for field in fields {
         let name = field.ident.clone().expect("named fields checked above");
@@ -160,8 +163,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
 
         if opts.index {
-            let index_name = opts.index_name.unwrap_or_else(|| name.to_string());
-            indexes.push((index_name, name, opts.unique));
+            indexes.push((name, field.ty.clone(), opts.unique));
         }
     }
 
@@ -176,7 +178,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     // --- generated pieces ---------------------------------------------------
     let index_count = indexes.len();
-    let index_entries = indexes.iter().map(|(index_name, field, unique)| {
+    let index_entries = indexes.iter().map(|(field, _, unique)| {
+        let index_name = field.to_string();
         quote! {
             _mvcc::IndexDesc {
                 name: #index_name,
@@ -185,6 +188,28 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     });
+
+    // One associated const per index, named after the field in upper case, so
+    // `tx.scan_index(Item::OWNER, …)` is resolved and type-checked by the
+    // compiler rather than matched against a string at runtime. `pub` so the
+    // const is as visible as the struct; the `allow`s are because generated
+    // code cannot know whether the struct is public or whether every index is
+    // actually scanned.
+    let index_consts = indexes
+        .iter()
+        .enumerate()
+        .map(|(position, (field, key_ty, _))| {
+            let const_name =
+                format_ident!("{}", field.to_string().to_uppercase(), span = field.span());
+            let index_name = field.to_string();
+            let doc = format!("The `{index_name}` secondary index. See [`Index`](::mvcc::Index).");
+            quote! {
+                #[doc = #doc]
+                #[allow(dead_code, unreachable_pub)]
+                pub const #const_name: _mvcc::Index<#ty, #key_ty> =
+                    _mvcc::Index::new(#position, #index_name);
+            }
+        });
 
     let table_id_cell = format_ident!("__MVCC_TABLE_ID");
     let index_table = format_ident!("__MVCC_INDEXES");
@@ -197,6 +222,13 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::std::sync::OnceLock::new();
 
             static #index_table: [_mvcc::IndexDesc<#ty>; #index_count] = [ #(#index_entries),* ];
+
+            // An inherent impl inside a `const _` block still attaches to the
+            // type globally, so these consts are reachable as `#ty::NAME` from
+            // anywhere the type is, without leaking anything else.
+            impl #ty {
+                #(#index_consts)*
+            }
 
             impl _mvcc::Versioned for #ty {
                 type Key = #key_type;

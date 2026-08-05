@@ -73,7 +73,7 @@ mod core;
 mod engine;
 
 pub use crate::core::{
-    Error, IsolationLevel, ReadCommitted, RepeatableRead, Result, Serializable, Snapshot,
+    Error, Index, IsolationLevel, ReadCommitted, RepeatableRead, Result, Serializable, Snapshot,
     Timestamp, TxnId, Versioned,
 };
 pub use crate::engine::store::Config;
@@ -100,5 +100,5 @@ pub mod stats {
 /// internal path is not a breaking change.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::core::{Encodable, IndexDesc, IndexKey, TableId, Versioned};
+    pub use crate::core::{Encodable, Index, IndexDesc, IndexKey, TableId, Versioned};
 }

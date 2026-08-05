@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::core::{
-    Encodable, Error, IndexKey, IsolationLevel, Result, Timestamp, TxnId, Versioned, Visibility,
+    Encodable, Error, Index, IndexKey, IsolationLevel, Result, Timestamp, TxnId, Versioned,
+    Visibility,
 };
 
 use crossbeam_epoch::{Guard, Owned, Shared};
@@ -718,13 +719,48 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
     /// Range scan over a secondary index, in index key order.
     ///
-    /// The index is named by the `&'static str` the derive produced, so a typo
-    /// is an error rather than an empty result.
+    /// The index is the associated const the derive emitted for the field —
+    /// `#[mvcc(index)] owner: u64` gives `Item::OWNER` — so a wrong name does
+    /// not compile, and neither does a range of the wrong type. Both used to be
+    /// runtime outcomes: a bad name an error, a mistyped range an empty result.
+    ///
+    /// ```
+    /// use mvcc::{Config, Database, Mvcc};
+    ///
+    /// #[derive(Mvcc, Clone)]
+    /// struct Item {
+    ///     #[mvcc(primary_key)] id: u64,
+    ///     #[mvcc(index)] owner: u64,
+    /// }
+    ///
+    /// let db = Database::open(Config::in_memory())?;
+    /// db.register::<Item>()?;
+    /// let mut tx = db.begin();
+    /// let owned = tx.scan_index(Item::OWNER, 1u64..=3)?;
+    /// assert!(owned.is_empty());
+    /// # Ok::<(), mvcc::Error>(())
+    /// ```
+    ///
+    /// Scanning that index with a range of the wrong type does not compile:
+    ///
+    /// ```compile_fail
+    /// # use mvcc::{Config, Database, Mvcc};
+    /// # #[derive(Mvcc, Clone)]
+    /// # struct Item {
+    /// #     #[mvcc(primary_key)] id: u64,
+    /// #     #[mvcc(index)] owner: u64,
+    /// # }
+    /// # let db = Database::open(Config::in_memory()).unwrap();
+    /// # db.register::<Item>().unwrap();
+    /// # let mut tx = db.begin();
+    /// // `owner` is a `u64`, so a `String` range has nothing to unify with.
+    /// tx.scan_index(Item::OWNER, "a".to_string().."b".to_string()).unwrap();
+    /// ```
     ///
     /// Under `Serializable` the range is recorded and re-scanned at commit, so
     /// a concurrent insert *into the range* aborts this transaction while one
     /// outside it does not.
-    pub fn scan_index<T, K, R>(&mut self, index: &str, range: R) -> Result<Vec<Ref<'_, T>>>
+    pub fn scan_index<T, K, R>(&mut self, index: Index<T, K>, range: R) -> Result<Vec<Ref<'_, T>>>
     where
         T: Versioned,
         K: Encodable,
@@ -733,13 +769,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         self.ensure_live()?;
         let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
-
-        let position = table
-            .index_position(index)
-            .ok_or_else(|| Error::NoSuchIndex {
-                table: T::TABLE_NAME,
-                index: index.to_string(),
-            })?;
+        let position = index.position;
 
         let encode_bound = |b: Bound<&K>| match b {
             Bound::Included(k) => Bound::Included(k.encode()),

@@ -33,9 +33,6 @@ pub enum Error {
     /// to a different slot and leave the old one holding a value that no longer
     /// matches its key. Delete and re-insert instead.
     PrimaryKeyChanged { table: &'static str },
-
-    /// No index of that name is declared on the table.
-    NoSuchIndex { table: &'static str, index: String },
 }
 
 impl Error {
@@ -72,9 +69,6 @@ impl fmt::Display for Error {
                 f,
                 "an update may not change the primary key of `{table}`; delete and insert instead"
             ),
-            Error::NoSuchIndex { table, index } => {
-                write!(f, "no index `{index}` on table `{table}`")
-            }
         }
     }
 }

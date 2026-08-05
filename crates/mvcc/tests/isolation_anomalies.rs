@@ -375,7 +375,7 @@ fn secondary_index_scans_respect_visibility() -> Result<()> {
     let mut reader = db.begin_with::<Snapshot>();
     assert_eq!(
         reader
-            .scan_index::<Item, _, _>("tag", "red".to_string()..="red".to_string())?
+            .scan_index(Item::TAG, "red".to_string()..="red".to_string())?
             .len(),
         2
     );
@@ -390,13 +390,13 @@ fn secondary_index_scans_respect_visibility() -> Result<()> {
     // index entry for item 2 is filtered by the recheck, not by index cleanup.
     assert_eq!(
         reader
-            .scan_index::<Item, _, _>("tag", "red".to_string()..="red".to_string())?
+            .scan_index(Item::TAG, "red".to_string()..="red".to_string())?
             .len(),
         2
     );
     assert_eq!(
         db.begin()
-            .scan_index::<Item, _, _>("tag", "red".to_string()..="red".to_string())?
+            .scan_index(Item::TAG, "red".to_string()..="red".to_string())?
             .len(),
         1
     );
@@ -418,13 +418,13 @@ fn index_entries_survive_updates_that_leave_the_key_alone() -> Result<()> {
 
     // An update touching only a non-indexed field takes the skip path.
     db.transaction(|tx| tx.update::<Item>(&1, |i| i.value += 10).map(|_| ()))?;
-    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+    assert_eq!(db.begin().scan_index(Item::TAG, red())?.len(), 2);
 
     // Repeatedly, so a stale entry cannot be masked by one fresh insert.
     for _ in 0..3 {
         db.transaction(|tx| tx.update::<Item>(&2, |i| i.value += 1).map(|_| ()))?;
     }
-    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+    assert_eq!(db.begin().scan_index(Item::TAG, red())?.len(), 2);
 
     // Out of the group and back: the return write does *not* skip, because the
     // version it displaces has key "green".
@@ -432,9 +432,9 @@ fn index_entries_survive_updates_that_leave_the_key_alone() -> Result<()> {
         tx.update::<Item>(&2, |i| i.tag = "green".into())
             .map(|_| ())
     })?;
-    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 1);
+    assert_eq!(db.begin().scan_index(Item::TAG, red())?.len(), 1);
     db.transaction(|tx| tx.update::<Item>(&2, |i| i.tag = "red".into()).map(|_| ()))?;
-    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+    assert_eq!(db.begin().scan_index(Item::TAG, red())?.len(), 2);
 
     // A delete installs a tombstone, so the write after it sees no previous
     // value and re-indexes rather than skipping.
@@ -446,7 +446,7 @@ fn index_entries_survive_updates_that_leave_the_key_alone() -> Result<()> {
             value: 1,
         })
     })?;
-    assert_eq!(db.begin().scan_index::<Item, _, _>("tag", red())?.len(), 2);
+    assert_eq!(db.begin().scan_index(Item::TAG, red())?.len(), 2);
     Ok(())
 }
 

@@ -19,7 +19,7 @@ pub(crate) mod versioned;
 
 pub use error::{Error, Result};
 pub use isolation::{IsolationLevel, ReadCommitted, RepeatableRead, Serializable, Snapshot};
-pub use schema::{Encodable, IndexDesc, IndexKey, TableId};
+pub use schema::{Encodable, Index, IndexDesc, IndexKey, TableId};
 pub use time::{Timestamp, TxnId};
 // Internal: the decoded form of a version stamp, never named in a public
 // signature.

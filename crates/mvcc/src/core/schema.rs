@@ -4,6 +4,8 @@
 //! key, and its secondary indexes — so the engine can build storage without
 //! reflection and without a runtime schema registry lookup on the hot path.
 
+use core::{fmt, marker::PhantomData};
+
 /// Dense identifier for a table, assigned at registration.
 ///
 /// Dense and small so the engine can index tables with an array rather than a
@@ -26,9 +28,59 @@ impl IndexKey {
     }
 }
 
+/// A handle to one of `T`'s secondary indexes, naming the field it covers and
+/// the type of that field.
+///
+/// `#[derive(Mvcc)]` emits one of these as an associated const per indexed
+/// field, named after the field in upper case — `#[mvcc(index)] owner: u64`
+/// becomes `Item::OWNER: Index<Item, u64>`. Scans take the const rather than a
+/// string, so both halves of the old `scan_index("owner", …)` are checked: a
+/// wrong name is an unresolved item, and a range whose type does not match the
+/// indexed field fails to unify with `K` instead of silently matching nothing.
+///
+/// It is `Copy` and holds only a position, so passing one costs nothing.
+pub struct Index<T, K> {
+    /// Position in [`Versioned::indexes`](crate::Versioned::indexes).
+    pub position: usize,
+    /// The indexed field's name, for diagnostics.
+    pub name: &'static str,
+    /// Ties the handle to its record and key type without owning either.
+    /// `fn(&T) -> K` rather than `(T, K)` so the handle stays `Send + Sync`
+    /// whatever the record is — it describes the extraction, not a value.
+    _record: PhantomData<fn(&T) -> K>,
+}
+
+impl<T, K> Index<T, K> {
+    /// Called by the derive. Constructing one by hand with a position that is
+    /// not this type's index is a logic error, not a memory-safety one: the
+    /// position is bounds-checked against `T::indexes()` on use.
+    #[doc(hidden)]
+    pub const fn new(position: usize, name: &'static str) -> Self {
+        Index {
+            position,
+            name,
+            _record: PhantomData,
+        }
+    }
+}
+
+impl<T, K> Clone for Index<T, K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T, K> Copy for Index<T, K> {}
+
+impl<T, K> fmt::Debug for Index<T, K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Index({})", self.name)
+    }
+}
+
 /// A secondary index over `T`, described at compile time.
 pub struct IndexDesc<T> {
-    /// Field name, or a user-supplied name for composite indexes.
+    /// The indexed field's name. Used in `DuplicateKey` errors and by
+    /// [`Index`], which is how user code refers to it.
     pub name: &'static str,
     /// Whether inserts must fail on a duplicate.
     pub unique: bool,

@@ -357,11 +357,6 @@ impl<T: Versioned> Table<T> {
         }
     }
 
-    /// Resolve an index name to its position, for scans.
-    pub(crate) fn index_position(&self, name: &str) -> Option<usize> {
-        T::indexes().iter().position(|d| d.name == name)
-    }
-
     /// Candidate primary keys in an index range.
     pub(crate) fn index_candidates(
         &self,

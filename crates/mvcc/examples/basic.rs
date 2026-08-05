@@ -78,7 +78,7 @@ fn main() -> Result<()> {
 
     // ---- scan by secondary index ------------------------------------------
     println!("\nbranch 10:");
-    for account in tx.scan_index::<Account, _, _>("branch", 10u32..=10)? {
+    for account in tx.scan_index(Account::BRANCH, 10u32..=10)? {
         println!("  {} ({})", account.owner, account.balance);
     }
     drop(tx);

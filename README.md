@@ -141,11 +141,12 @@ struct Account {
 
 | attribute | on | meaning |
 | --- | --- | --- |
-| `#[mvcc(table = "name")]` | struct | table name; defaults to the type name |
+| `#[mvcc(table = "name")]` | struct | table name in error messages; defaults to the type name |
 | `#[mvcc(primary_key)]` | field | required, exactly one |
 | `#[mvcc(index)]` | field | secondary index |
 | `#[mvcc(index(unique))]` | field | unique secondary index |
-| `#[mvcc(index(name = "…"))]` | field | override the index name |
+
+An index is always named after its field, and the derive emits a handle for it as an associated const in upper case — `#[mvcc(index)] branch: u32` gives `Account::BRANCH`. That const, not a string, is what a scan takes, so the index name and the range's type are both checked at compile time.
 
 The derive does **not** make the struct itself transactional. `Account` stays a plain struct with no interior mutability, no `Drop` and no hidden fields — all transactional behaviour is on `Transaction`, which is where errors can actually be returned.
 
@@ -194,8 +195,9 @@ for account in tx.scan_where::<Account, _>(|a| a.balance < 0)? {
     println!("overdrawn: {}", account.owner);
 }
 
-// Over a secondary index.
-for account in tx.scan_index::<Account, _, _>("branch", 10u32..=20)? {
+// Over a secondary index. `Account::BRANCH` is `Index<Account, u32>`, so a
+// misspelled index or a range of the wrong type is a compile error.
+for account in tx.scan_index(Account::BRANCH, 10u32..=20)? {
     println!("{}", account.owner);
 }
 ```
@@ -242,7 +244,6 @@ if err.is_retriable() { /* WriteConflict or SerializationFailure */ }
 | `DuplicateKey` | ✘ | the value violates a unique index |
 | `PrimaryKeyChanged` | ✘ | an `update` tried to change the primary key |
 | `TableNotRegistered` | ✘ | `db.register::<T>()` was never called |
-| `NoSuchIndex` | ✘ | no index by that name |
 | `Aborted` | ✘ | the transaction was already finished |
 
 The non-retriable ones are programming mistakes. Retrying them just burns time before reporting the same thing.
