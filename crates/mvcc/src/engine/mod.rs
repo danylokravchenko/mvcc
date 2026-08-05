@@ -11,6 +11,7 @@
 pub(crate) mod gc;
 pub(crate) mod hash;
 pub(crate) mod oracle;
+pub(crate) mod slotmap;
 pub(crate) mod ssi;
 pub(crate) mod store;
 pub(crate) mod txn;

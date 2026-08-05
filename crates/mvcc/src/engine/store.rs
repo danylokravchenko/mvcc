@@ -20,23 +20,40 @@
 //!
 //! # Implementation status
 //!
-//! The chain is built from `Arc` and `RwLock` rather than the `AtomicPtr`
-//! design in `DESIGN.md`. That is deliberate sequencing, not an accident:
-//! correctness first, in safe Rust, with the semantics pinned down by tests.
-//! Swapping in lock-free chains and epoch-based reclamation is an internal
-//! change that the public API cannot observe.
+//! The chain is lock-free. `Slot::latest` and `Version::prev` are epoch-managed
+//! `Atomic`s, so following a chain is plain pointer loads and a visibility
+//! comparison — no lock, no reference count, no write to shared memory. A
+//! transaction pins one epoch for its whole life, which is what lets a `Ref`
+//! borrow a version rather than count it.
 //!
-//! The `Arc` version holds one real cost, and it is now measured rather than
-//! suspected. Cloning an `Arc` on read is an atomic increment on a shared cache
-//! line, and an `RwLock` read is another — so a single `get` performs several
-//! shared writes before it touches any data. `cargo bench` shows point reads
-//! going from 15.0M ops/sec on one thread to 3.7M on eight; see `DESIGN.md` §6.
+//! The map in front of it is lock-free too. [`SlotMap`] resolves a primary key
+//! to a slot by probing an epoch-managed bucket array, so **a point read now
+//! performs no write to shared memory at any point on the path** — which is the
+//! property this whole design is built around, and it took removing two things
+//! to get: the `Arc` refcount on the chain, and the shard `RwLock` in front of
+//! it, whose *read* acquire was still an atomic read-modify-write.
 //!
-//! So the "reads take no locks and perform no writes to shared memory" property
-//! this design is built around **is not true yet**. Making it true is the
-//! lock-free chain, EBR and ART-with-OLC work. The three offenders, in the order
-//! worth fixing them: `Database::tables` (one shared refcount, touched on every
-//! operation), `Table::slots`, and `Slot::latest`.
+//! Measured, not assumed, at four threads:
+//!
+//! ```text
+//!                            Arc + RwLock    sharded RwLock    lock-free
+//!   point reads, uniform          3.7M           111.9M          221.2M
+//!   point reads, 4 hot rows          —            49.0M          475.2M
+//! ```
+//!
+//! The middle column is where sharding had hidden the problem for uniform keys
+//! and could not for hot ones: four keys land in at most four shards however
+//! many shards there are, so that workload was the only one in the benchmark
+//! that went *backwards* with more threads. See `crate::engine::slotmap`.
+//!
+//! What a read still touches: **`Database::tables`**, one registry `RwLock`,
+//! amortised by the transaction's `table_cache` to about once per table per
+//! transaction.
+//!
+//! And what only writers touch: the `RwLock` on each secondary index (taken
+//! exclusively, but only by writes that actually change that index's key — see
+//! [`Table::index_record`]), `Table::predicate_locks`, and `Slot::readers`,
+//! which stays empty below `Serializable`.
 //!
 //! # Locks
 //!
@@ -67,8 +84,8 @@ use crate::core::{
 
 use crossbeam_epoch::{Atomic, Guard, Shared};
 
-use crate::engine::hash::FxBuildHasher;
 use crate::engine::oracle::{Oracle, OracleConfig};
+use crate::engine::slotmap::SlotMap;
 use crate::engine::ssi::{Readers, TxnState};
 use crate::engine::txn::Transaction;
 
@@ -127,7 +144,7 @@ pub(crate) struct Slot<T> {
 }
 
 impl<T> Slot<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Slot {
             latest: Atomic::null(),
             lock: AtomicU64::new(0),
@@ -219,24 +236,14 @@ impl<T> Slot<T> {
     }
 }
 
-/// A registered table: the primary map plus any secondary indexes.
-/// Independent shards of a table's primary map.
-///
-/// One `RwLock` over the whole map is a single cache line that every core
-/// touches on every key lookup, which is one of the three things `DESIGN.md` §6
-/// identifies as stopping reads from scaling. Sharding by key hash spreads that
-/// across `SLOT_SHARDS` lines.
-const SLOT_SHARDS: usize = 64;
-
-type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>, FxBuildHasher>>;
-
 /// Rows a scan returned: primary key and the version it matched through, in
 /// primary key order. Borrowed from the caller's epoch pin, never cloned.
 type Matches<'g, T> = Vec<(<T as Versioned>::Key, &'g Version<T>)>;
 
+/// A registered table: the primary map plus any secondary indexes.
 pub(crate) struct Table<T: Versioned> {
-    /// Primary key to slot, sharded by key hash. See [`SLOT_SHARDS`].
-    slots: Box<[SlotShard<T>]>,
+    /// Primary key to slot. Lock-free on the read path — see [`SlotMap`].
+    slots: SlotMap<T>,
     /// One per `#[mvcc(index)]` field, in declaration order.
     ///
     /// Entries are *candidates*, not answers: an index maps a key to primary
@@ -268,18 +275,22 @@ impl<T: Versioned> Drop for Table<T> {
         // chains can be freed directly rather than deferred. `unprotected` is
         // exactly the escape hatch for that situation.
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        for shard in &mut self.slots {
-            for slot in shard.get_mut().values() {
-                let mut cur = slot.latest.swap(Shared::null(), Ordering::Relaxed, guard);
-                while !cur.is_null() {
-                    // SAFETY: each version belongs to exactly one chain and is
-                    // reached once, so this takes ownership exactly once.
-                    let owned = unsafe { cur.into_owned() };
-                    cur = owned.prev.load(Ordering::Relaxed, guard);
-                    drop(owned);
-                }
+        // Runs before the field itself drops, so the records are still there.
+        // `SlotMap::drop` then frees the records; the chains hanging off them
+        // are this table's to free, because `Atomic` does not own its pointee.
+        self.slots.for_each(guard, |record| {
+            let mut cur = record
+                .slot
+                .latest
+                .swap(Shared::null(), Ordering::Relaxed, guard);
+            while !cur.is_null() {
+                // SAFETY: each version belongs to exactly one chain and is
+                // reached once, so this takes ownership exactly once.
+                let owned = unsafe { cur.into_owned() };
+                cur = owned.prev.load(Ordering::Relaxed, guard);
+                drop(owned);
             }
-        }
+        });
     }
 }
 
@@ -292,9 +303,7 @@ struct PredicateLock<T> {
 impl<T: Versioned> Table<T> {
     fn new() -> Self {
         Table {
-            slots: (0..SLOT_SHARDS)
-                .map(|_| RwLock::new(HashMap::default()))
-                .collect(),
+            slots: SlotMap::new(),
             secondary: T::indexes()
                 .iter()
                 .map(|_| RwLock::new(BTreeMap::new()))
@@ -303,46 +312,23 @@ impl<T: Versioned> Table<T> {
         }
     }
 
-    fn shard(&self, key: &T::Key) -> &SlotShard<T> {
-        &self.slots[(crate::engine::hash::hash_one(key) as usize) % SLOT_SHARDS]
-    }
-
-    /// Borrow the slot for `key`, for as long as the table is borrowed.
+    /// The slot for `key`, borrowed for as long as the table is.
     ///
-    /// A reference rather than an `Arc`, for the same reason `Database::table`
-    /// is: this is on every lookup, and the clone was an atomic increment and
-    /// decrement per operation.
-    ///
-    /// # Safety
-    ///
-    /// The borrow is extended from the shard's read guard to `&self`. Sound
-    /// because the slot map is **append-only** — `slot_or_create` inserts and
-    /// nothing ever removes — so the `Arc` owning this `Slot` lives as long as
-    /// the table, and the `Slot` itself is on the heap and never moves. The map
-    /// rehashing moves the `Arc`, not its referent.
+    /// Takes no locks and writes nothing to shared memory — the map is
+    /// append-only, so the record this borrows lives as long as the table
+    /// does. See [`SlotMap`] for why that is the whole design.
     ///
     /// A delete does not remove a slot; it installs a tombstone version, so
     /// readers at older snapshots still find the record. If garbage collection
-    /// ever starts reclaiming empty slots, this reasoning breaks and both
-    /// methods have to go back to returning an `Arc`.
-    pub(crate) fn slot(&self, key: &T::Key) -> Option<&Slot<T>> {
-        let shard = self.shard(key).read();
-        let slot: &Slot<T> = shard.get(key)?;
-        // SAFETY: see the doc comment above.
-        Some(unsafe { &*(slot as *const Slot<T>) })
+    /// ever starts reclaiming empty slots, that reasoning breaks and the map
+    /// needs real reclamation rather than an append-only argument.
+    pub(crate) fn slot(&self, key: &T::Key, guard: &Guard) -> Option<&Slot<T>> {
+        self.slots.get(key, guard)
     }
 
-    /// Borrow the slot for `key`, creating an empty one if absent.
-    pub(crate) fn slot_or_create(&self, key: &T::Key) -> &Slot<T> {
-        if let Some(s) = self.slot(key) {
-            return s;
-        }
-        let mut shard = self.shard(key).write();
-        let slot: &Slot<T> = shard
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Slot::new()));
-        // SAFETY: see `Table::slot`.
-        unsafe { &*(slot as *const Slot<T>) }
+    /// The slot for `key`, creating an empty one if absent.
+    pub(crate) fn slot_or_create(&self, key: &T::Key, guard: &Guard) -> &Slot<T> {
+        self.slots.get_or_create(key, guard)
     }
 
     /// Record `record`'s index keys as candidates, skipping any index whose key
@@ -389,44 +375,16 @@ impl<T: Versioned> Table<T> {
             .collect()
     }
 
-    /// Visit every slot in the table, taking each shard lock exactly once.
+    /// Visit every slot in the table, taking no locks at all.
     ///
-    /// The slot borrows deliberately outlive the shard guard. The alternative —
-    /// collect the keys under the lock, then look each one up again — costs a
-    /// key clone, a hash and a second lock acquisition *per row*, and a scan is
-    /// the one operation that pays those on every row in the table rather than
-    /// on one.
-    ///
-    /// `f` runs with no lock held, so a user predicate cannot block writers to
-    /// a shard and the module invariant that no user code runs under an engine
-    /// lock survives.
-    ///
-    /// # Safety
-    ///
-    /// The same argument as [`Table::slot`]: the slot map is append-only, so
-    /// the `Arc` owning each `Slot` lives as long as the table, and the `Slot`
-    /// is on the heap and never moves — rehashing moves the `Arc`, not its
-    /// referent.
-    ///
-    /// It does **not** extend to the map's keys, which are stored inline and do
-    /// move on rehash. That is why callers recover the primary key from the
-    /// record via [`Versioned::key`] rather than borrowing it from the map —
-    /// which is also why they pay for a key clone per *match* instead of per
-    /// row.
-    fn visit_slots<'s>(&'s self, mut f: impl FnMut(&'s Slot<T>)) {
-        let mut batch: Vec<&'s Slot<T>> = Vec::new();
-        for shard in &self.slots {
-            {
-                let shard = shard.read();
-                batch.extend(shard.values().map(|slot| {
-                    // SAFETY: see the doc comment above.
-                    unsafe { &*Arc::as_ptr(slot) }
-                }));
-            }
-            for slot in batch.drain(..) {
-                f(slot);
-            }
-        }
+    /// A scan is the one operation that pays per-row costs on every row in the
+    /// table rather than on one, so the difference between this and looking
+    /// each key up again — a hash and a lock acquisition per row — is the
+    /// difference the scan benchmarks measure. Since [`SlotMap`] hands out
+    /// record borrows that outlive any epoch, there is nothing left to release
+    /// and nothing to batch.
+    fn visit_slots<'s>(&'s self, guard: &Guard, mut f: impl FnMut(&'s Slot<T>)) {
+        self.slots.for_each(guard, |record| f(&record.slot));
     }
 
     /// Every record visible at `snapshot` that satisfies `predicate`, in
@@ -444,7 +402,7 @@ impl<T: Versioned> Table<T> {
         guard: &'g Guard,
     ) -> Matches<'g, T> {
         let mut out = Vec::new();
-        self.visit_slots(|slot| {
+        self.visit_slots(guard, |slot| {
             if let Some(version) = slot.read(snapshot, reader, guard)
                 && let Some(value) = version.value.as_ref()
                 && predicate(value)
@@ -455,7 +413,12 @@ impl<T: Versioned> Table<T> {
         // Sorting the matches rather than the whole key space is the point of
         // deriving keys from records: a selective predicate sorts a handful of
         // rows where collecting keys up front sorted every row in the table.
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        // Unstable: primary keys are unique, so there are no equal elements
+        // for stability to order — and the stable sort's `n/2` scratch buffer
+        // is a 160KB allocation on a scan of this size. The sort is the
+        // dominant cost of an unselective scan, 72% of it when measured by
+        // deleting it.
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
@@ -475,7 +438,7 @@ impl<T: Versioned> Table<T> {
     ) -> (Matches<'g, T>, Matches<'g, T>) {
         let mut seen = Vec::new();
         let mut committed = Vec::new();
-        self.visit_slots(|slot| {
+        self.visit_slots(guard, |slot| {
             let (a, b) = slot.read_pair(snapshot, reader, guard);
             let same = match (a, b) {
                 (Some(a), Some(b)) => std::ptr::eq(a, b),
@@ -502,8 +465,8 @@ impl<T: Versioned> Table<T> {
                 committed.push((value.key(), version));
             }
         });
-        seen.sort_by(|a, b| a.0.cmp(&b.0));
-        committed.sort_by(|a, b| a.0.cmp(&b.0));
+        seen.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        committed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         (seen, committed)
     }
 
@@ -539,7 +502,7 @@ impl<T: Versioned> Table<T> {
         // rolled-back writes.
         let mut out: Vec<(IndexKey, T::Key, &'g Version<T>)> = Vec::new();
         for key in self.index_candidates(position, lo.clone(), hi.clone()) {
-            let Some(slot) = self.slot(&key) else {
+            let Some(slot) = self.slot(&key, guard) else {
                 continue;
             };
             let Some(version) = slot.read(snapshot, reader, guard) else {
@@ -553,7 +516,7 @@ impl<T: Versioned> Table<T> {
                 out.push((actual, key, version));
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         out.into_iter().map(|(_, k, v)| (k, v)).collect()
     }
 
@@ -615,7 +578,7 @@ impl<T: Versioned> Table<T> {
                 }
                 // Recheck: the candidate may have moved off this key, or its
                 // visible version may not exist at this snapshot.
-                let Some(slot) = self.slot(&candidate) else {
+                let Some(slot) = self.slot(&candidate, guard) else {
                     continue;
                 };
                 let Some(version) = slot.read(snapshot, reader, guard) else {

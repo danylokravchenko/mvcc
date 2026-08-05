@@ -128,6 +128,122 @@ fn readers_survive_writers_aborting_underneath_them() -> Result<()> {
 }
 
 #[test]
+fn concurrent_inserts_survive_the_slot_map_growing_under_readers() -> Result<()> {
+    // Aimed at `engine::slotmap`. The existing tests here work over eight keys
+    // seeded up front, so they never grow a bucket array and never race an
+    // insert against a lookup — which is precisely the part of that module with
+    // no lock to hide behind.
+    //
+    // 12k keys over 64 shards is roughly 190 per shard, so every shard doubles
+    // its array four times from `INITIAL_CAPACITY`, with readers probing
+    // throughout. Two failures are in scope: a reader following a bucket array
+    // being replaced, and two inserters racing on the same key and each
+    // installing a record — a key with two slots, which reads as a lost update
+    // rather than as a crash.
+    const N: u64 = 12_000;
+    const WRITERS: u64 = 4;
+
+    let db = Arc::new(Database::open(Config::in_memory())?);
+    db.register::<Row>()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let probes = Arc::new(AtomicU64::new(0));
+
+    // Readers probing for keys that are appearing underneath them. A key is
+    // either absent or fully formed; a torn label or a missing row that was
+    // already observed present would mean a bad publication.
+    let readers: Vec<_> = (0..4)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            let probes = Arc::clone(&probes);
+            thread::spawn(move || -> Result<()> {
+                let mut seed = 0xfeed_face_cafe_d00du64 ^ (t + 1);
+                while !stop.load(Ordering::Relaxed) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let id = seed % N;
+                    let mut tx = db.begin_with::<Snapshot>();
+                    if let Some(row) = tx.get::<Row>(&id)? {
+                        assert_eq!(row.id, id, "lookup returned another key's slot");
+                        assert_eq!(row.label, format!("row-{id}"), "torn version");
+                    }
+                    probes.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    // Every key is offered by *two* writers, so the same-key insert race is hit
+    // continuously rather than incidentally.
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || -> Result<()> {
+                for id in (t % 2..N).step_by(2) {
+                    let outcome = db.transaction(|tx| {
+                        tx.insert(Row {
+                            id,
+                            value: 0,
+                            label: format!("row-{id}"),
+                        })
+                    });
+                    // Losing the race is the expected outcome for one of the
+                    // two writers offering each key, either way round.
+                    if let Err(e) = outcome
+                        && !matches!(e, Error::DuplicateKey { .. } | Error::WriteConflict { .. })
+                    {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    for w in writers {
+        w.join().expect("writer panicked")?;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().expect("reader panicked")?;
+    }
+
+    // Every key present exactly once. A duplicated slot shows up here as a
+    // count above `N`, and a lost record as one below.
+    let mut tx = db.begin();
+    let rows = tx.scan::<Row>()?;
+    assert_eq!(
+        rows.len(),
+        N as usize,
+        "slot count wrong after concurrent growth"
+    );
+    let mut ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), N as usize, "a key was installed in two slots");
+    drop(tx);
+
+    // And each one is reachable by the index, not merely present in a scan —
+    // a record appended to the chunk list but lost by the bucket array during a
+    // resize would pass the assertions above and fail here.
+    let mut tx = db.begin();
+    for id in 0..N {
+        assert!(
+            tx.get::<Row>(&id)?.is_some(),
+            "key {id} unreachable by lookup"
+        );
+    }
+
+    assert!(
+        probes.load(Ordering::Relaxed) > 1_000,
+        "too few concurrent probes to be meaningful"
+    );
+    Ok(())
+}
+
+#[test]
 fn contended_serializable_transfers_conserve_and_terminate() -> Result<()> {
     // Every transfer touches two of eight keys at `Serializable`, so aborts,
     // retries, SIREAD registration and reclamation all run flat out and overlap.

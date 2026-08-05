@@ -16,7 +16,7 @@
 //! adversarial-input resistance for its keys, the answer is to make the map's
 //! hasher configurable, not to hand this one out.
 
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::Hasher;
 
 /// The odd multiplier from `FxHash` — the fractional bits of the golden ratio.
 const SEED: u64 = 0x517c_c1b7_2722_0a95;
@@ -105,8 +105,6 @@ impl Hasher for FxHasher {
         self.add(n as u64)
     }
 }
-
-pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// Hash one key, for shard selection.
 #[inline]

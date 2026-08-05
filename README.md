@@ -96,6 +96,8 @@ The newest version sits one hop from the index rather than at the end of a chain
 
 Take a snapshot timestamp, walk the chain until a version is visible at it. No locks, no reference counts, no writes to shared memory — a read is a pointer load and a comparison. A transaction pins one epoch for its whole life, which is what lets versions be borrowed rather than counted.
 
+That holds for finding the record as well as for reading it: the primary key map is append-only, so a lookup probes it without taking a lock. Nothing about a read is visible to any other core, which is why hot rows scale rather than collapse.
+
 Because the snapshot is fixed, a transaction's view never changes underneath it, no matter what commits alongside.
 
 ### Writing
@@ -374,29 +376,36 @@ See [`crates/mvcc/tests/hermitage.rs`](crates/mvcc/tests/hermitage.rs).
 
 `cargo bench`, Apple M1 (4 performance + 4 efficiency cores), so **4 threads is the meaningful number** — an eighth thread lands on an efficiency core and drags the average down for reasons unrelated to contention.
 
-| ops/sec | 1 thread | 4 threads |
-| --- | --- | --- |
-| point reads (uniform keys) | 49.7M | **112.6M** |
-| point reads (4 hot rows) | 89.9M | 49.0M |
-| read-only transactions | 12.7M | 15.9M |
-| write transactions (snapshot) | 5.8M | 6.2M |
-| write transactions (serializable) | 1.24M | 2.06M |
+| ops/sec | 1 thread | 4 threads | |
+| --- | --- | --- | --- |
+| point reads (uniform keys) | 62.2M | **217.2M** | 3.5× |
+| point reads (4 hot rows) | 140.4M | **480.8M** | 3.4× |
+| read-only transactions | 14.7M | 16.1M | |
+| write transactions (snapshot) | 6.2M | 6.1M | |
+| write transactions (serializable) | 1.59M | 2.96M | |
+| `scan_where`, 1% of 10k rows | 17.0k | 60.6k | |
+| `scan_where`, all of 10k rows | 6.2k | 22.8k | |
 
-Reads scale 2.3× across four cores. Writes are roughly flat: the commit timestamp counter is a single shared cache line and is the current floor.
+**Reads scale, including contended ones.** Nothing on the read path writes to shared memory — not a lock word, not a refcount — so four cores reading the same four rows do not fight over a cache line. That took removing two things: the `Arc` refcount on the version chain, and the sharded `RwLock` in front of it, whose *read* acquire was still an atomic read-modify-write. The hot-row row used to run *backwards*, 91M at one thread to 49M at four.
 
-Two things worth knowing when reading any number here:
+**Writes are roughly flat.** The commit timestamp counter is a single shared cache line and is the current floor.
+
+Three things worth knowing when reading any number here:
 
 - **Always state the thread count.** These workloads behave very differently at
   one thread and at four, and contended figures are the honest ones to quote.
 - **Hot rows are the realistic case.** Uniformly random keys leave per-record
   synchronization uncontended and therefore invisible; the benchmark includes a
   four-hot-row workload specifically because that is where design choices show.
+- **Scans are per-scan, not per-row**, over a 10,000-row table — so the 1% row
+  is roughly 600M rows/sec visited at four threads. An unselective scan is
+  dominated by sorting its result, not by reading it.
 
 `benches/throughput.rs` separates workloads by which shared structure they touch, so a result points at a cause rather than just a number.
 
 ## Status
 
-Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, epoch-based reclamation.
+Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, epoch-based reclamation, a lock-free primary key map.
 
 The examples are the fastest way in, and each one ends by asserting the world it
 built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is the end-to-end tour: two heroes reaching for the same sword (write conflict), a hero overloading herself (write skew, and the fix), a party filling up (a phantom), an atomic trade, a long report reading while the world moves, and a four-thread raid.

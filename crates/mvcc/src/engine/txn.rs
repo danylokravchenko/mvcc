@@ -277,7 +277,7 @@ fn writers_of_change<T: Versioned>(
         if current.iter().any(|(kc, _)| kc == key) {
             continue;
         }
-        if let Some(slot) = table.slot(key)
+        if let Some(slot) = table.slot(key, guard)
             && let Some(version) = slot.read(now, TxnId::NONE, guard)
         {
             writers.extend(version.writer.clone());
@@ -425,11 +425,11 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
-        let Some(slot) = table.slot(key) else {
+        let Some(slot) = table.slot(key, &self.guard) else {
             // Record the absence too: a `Serializable` transaction that acted
             // on "this key does not exist" must abort if someone creates it.
             if I::VALIDATES_READS {
-                let slot = table.slot_or_create(key);
+                let slot = table.slot_or_create(key, &self.guard);
                 let state = self
                     .state
                     .as_ref()
@@ -473,7 +473,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         key: &T::Key,
         value: Option<T>,
     ) -> Result<()> {
-        let slot = table.slot_or_create(key);
+        let slot = table.slot_or_create(key, &self.guard);
 
         // First-updater-wins, part one: whoever takes the lock owns the slot
         // until it commits or aborts.
@@ -548,7 +548,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let key = value.key();
         let snapshot = self.statement_snapshot();
 
-        if let Some(slot) = table.slot(&key)
+        if let Some(slot) = table.slot(&key, &self.guard)
             && slot
                 .read(snapshot, self.id, &self.guard)
                 .is_some_and(|v| v.value.is_some())
@@ -581,7 +581,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
-        let Some(slot) = table.slot(key) else {
+        let Some(slot) = table.slot(key, &self.guard) else {
             return Ok(false);
         };
         let Some(version) = slot.read(snapshot, self.id, &self.guard) else {
@@ -624,7 +624,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let table = self.table::<T>()?;
         let snapshot = self.statement_snapshot();
 
-        let Some(slot) = table.slot(key) else {
+        let Some(slot) = table.slot(key, &self.guard) else {
             return Ok(false);
         };
         if slot
@@ -825,7 +825,6 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         }
 
         let now = self.db.oracle().statement_snapshot();
-        let gc = self.db.oracle().gc_watermark();
 
         // --- outgoing edges: did anything I read change under me? -----------
         for read in &self.reads {
@@ -858,6 +857,12 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return false;
         }
         if self.ssi().has_out_conflict() {
+            // Computed here rather than up front: `gc_watermark` locks every
+            // one of the oracle's shards, and this branch is the only thing
+            // that wants it. A transaction whose read set did not change — the
+            // common case — was paying 16 mutex acquisitions on cache lines
+            // other threads are actively writing, for a value it discarded.
+            let gc = self.db.oracle().gc_watermark();
             for write in &self.writes {
                 for reader in write.conflicting_readers(self.id, gc) {
                     reader.set_out_conflict();
