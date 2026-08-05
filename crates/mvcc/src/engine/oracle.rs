@@ -28,7 +28,7 @@
 //!
 //! This needs commit timestamps to be **gap-free**, which is why transaction ids
 //! now come from their own counter. The two can no longer be told apart by
-//! value, and do not need to be: the tag bit in `mvcc_core::time` is what
+//! value, and do not need to be: the tag bit in `crate::core::time` is what
 //! distinguishes an in-flight writer from a commit timestamp.
 //!
 //! # The GC watermark, sharded
@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use mvcc_core::{Timestamp, TxnId};
+use crate::core::{Timestamp, TxnId};
 
 /// Slots in the completion ring. A commit only stalls if it runs this far ahead
 /// of the watermark, which takes this many commits installing at once.
@@ -198,7 +198,7 @@ impl Oracle {
     ///
     /// Ids and commit timestamps come from different counters and may coincide
     /// numerically. That is safe: a version's `begin` field is tagged (see
-    /// `mvcc_core::time`), and the tag — not the value — says whether it holds
+    /// `crate::core::time`), and the tag — not the value — says whether it holds
     /// an in-flight writer or a commit timestamp.
     pub fn next_txn_id(&self) -> TxnId {
         let slot = thread_slot();
@@ -319,7 +319,7 @@ impl Oracle {
     /// `end` is at or below this are unreachable and may be reclaimed.
     ///
     /// A single long-running reader pins this and stalls all reclamation — the
-    /// classic MVCC failure mode. See [`crate::gc`].
+    /// classic MVCC failure mode. See [`crate::engine::gc`].
     pub fn gc_watermark(&self) -> Timestamp {
         let oldest = self
             .active
@@ -332,7 +332,7 @@ impl Oracle {
         }
     }
 
-    /// Number of live transactions, for [`crate::gc::GcStats`].
+    /// Number of live transactions, for [`crate::engine::gc::GcStats`].
     pub fn active_count(&self) -> usize {
         self.active.iter().map(|s| s.snapshots.lock().len()).sum()
     }

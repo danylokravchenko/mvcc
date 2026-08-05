@@ -28,7 +28,7 @@
 //!   allowed**. This is the classic snapshot-isolation anomaly and the reason
 //!   `Serializable` exists.
 //! - `Serializable` — no anomalies, via SSI. The mechanism lives in
-//!   `mvcc_engine::ssi`: a transaction aborts only when it has an
+//!   `crate::engine::ssi`: a transaction aborts only when it has an
 //!   rw-antidependency in both directions.
 
 mod sealed {

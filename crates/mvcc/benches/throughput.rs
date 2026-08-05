@@ -20,7 +20,7 @@
 //!
 //! Reading the two *differences* rather than the three absolutes is the point:
 //! that is what localised the `parking_lot` win to the oracle (see
-//! `mvcc_engine::oracle`) rather than to the version-chain locks.
+//! `engine::oracle`) rather than to the version-chain locks.
 //!
 //! # Choosing a thread count
 //!

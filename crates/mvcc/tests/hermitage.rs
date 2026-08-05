@@ -35,7 +35,7 @@
 //! one shape that does still get through.
 //!
 //! `Serializable` is SSI: a transaction aborts only when it has an
-//! rw-antidependency edge in *both* directions (see `mvcc_engine::ssi`). An
+//! rw-antidependency edge in *both* directions (see `engine::ssi`). An
 //! outgoing edge alone — something you read was overwritten — is no longer
 //! enough, because such a transaction sits in no cycle. Several transcripts
 //! below rely on that.
@@ -738,7 +738,7 @@ fn g2_item_write_skew_possible_below_serializable() -> Result<()> {
 /// 3 and 4 did not exist when the predicates were evaluated, so there was no
 /// slot to record. `scan_where` therefore records the *predicate itself*
 /// alongside its result set, and commit re-evaluates it — see `PredicateRead`
-/// in `mvcc_engine::txn`.
+/// in `engine::txn`.
 ///
 /// T2 read `value % 3 = 0` and saw nothing. By the time T2 commits, T1's row 3
 /// matches. The result set changed, so T2 cannot be serialized.

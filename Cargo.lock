@@ -48,26 +48,13 @@ dependencies = [
 name = "mvcc"
 version = "0.1.0"
 dependencies = [
- "mvcc-core",
- "mvcc-engine",
- "mvcc-macros",
-]
-
-[[package]]
-name = "mvcc-core"
-version = "0.1.0"
-
-[[package]]
-name = "mvcc-engine"
-version = "0.1.0"
-dependencies = [
  "crossbeam-epoch",
- "mvcc-core",
+ "mvcc-derive",
  "parking_lot",
 ]
 
 [[package]]
-name = "mvcc-macros"
+name = "mvcc-derive"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",

@@ -1,6 +1,6 @@
 [package]
-name = "mvcc-macros"
-description = "#[derive(Mvcc)] for the mvcc crate. Not intended to be used directly."
+name = "mvcc-derive"
+description = "#[derive(Mvcc)] for the mvcc crate. Not intended to be depended on directly — use `mvcc`, which re-exports it."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

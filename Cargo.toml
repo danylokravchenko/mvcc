@@ -1,11 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-    "crates/mvcc",
-    "crates/mvcc-core",
-    "crates/mvcc-engine",
-    "crates/mvcc-macros",
-]
+members = ["crates/mvcc", "crates/mvcc-derive"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,9 +11,7 @@ repository = "https://github.com/danylokravchenko/mvcc"
 authors = ["Danylo Kravchenko <danylo.kravchenko.r@gmail.com>"]
 
 [workspace.dependencies]
-mvcc-core = { path = "crates/mvcc-core", version = "0.1.0" }
-mvcc-engine = { path = "crates/mvcc-engine", version = "0.1.0" }
-mvcc-macros = { path = "crates/mvcc-macros", version = "0.1.0" }
+mvcc-derive = { path = "crates/mvcc-derive", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

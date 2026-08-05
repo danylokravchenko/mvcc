@@ -144,7 +144,7 @@ fn main() -> Result<()> {
     );
 
     // The GC watermark should be advancing. If `active_transactions` climbs and
-    // the watermark stalls, some transaction is being leaked — see mvcc_engine::gc.
+    // the watermark stalls, some transaction is being leaked — see engine::gc.
     let stats = db.stats();
     println!(
         "\ngc watermark {:?}, {} transactions still live",

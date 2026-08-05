@@ -23,8 +23,8 @@
 //!   the check that used to abort on its own; now it only sets a flag.
 //!
 //! - **Incoming** (`R →rw self`): needs to know who read the rows this
-//!   transaction wrote — a *SIREAD lock*. [`Slot`](crate::store::Slot) keeps a
-//!   list of transactions that read it, and [`Table`](crate::store::Table)
+//!   transaction wrote — a *SIREAD lock*. [`Slot`](crate::engine::store::Slot) keeps a
+//!   list of transactions that read it, and [`Table`](crate::engine::store::Table)
 //!   keeps registered predicates so an *insert* can be matched against reads of
 //!   rows that did not exist yet. The second is what makes G2 detectable.
 //!
@@ -47,7 +47,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use mvcc_core::{Timestamp, TxnId};
+use crate::core::{Timestamp, TxnId};
 
 /// Shared, concurrently-updatable state for one transaction.
 ///
@@ -56,9 +56,8 @@ use mvcc_core::{Timestamp, TxnId};
 /// outlives the `Transaction` itself, since SIREAD locks and version records
 /// keep referring to it after commit.
 #[derive(Debug)]
-pub struct TxnState {
+pub(crate) struct TxnState {
     id: TxnId,
-    snapshot: Timestamp,
     /// A concurrent transaction overwrote something this one read.
     out_conflict: AtomicBool,
     /// A concurrent transaction read something this one overwrote.
@@ -69,10 +68,9 @@ pub struct TxnState {
 }
 
 impl TxnState {
-    pub fn new(id: TxnId, snapshot: Timestamp) -> Arc<Self> {
+    pub(crate) fn new(id: TxnId) -> Arc<Self> {
         Arc::new(TxnState {
             id,
-            snapshot,
             out_conflict: AtomicBool::new(false),
             in_conflict: AtomicBool::new(false),
             committed_at: AtomicU64::new(0),
@@ -80,46 +78,42 @@ impl TxnState {
         })
     }
 
-    pub fn id(&self) -> TxnId {
+    pub(crate) fn id(&self) -> TxnId {
         self.id
     }
 
-    pub fn snapshot(&self) -> Timestamp {
-        self.snapshot
-    }
-
-    pub fn set_out_conflict(&self) {
+    pub(crate) fn set_out_conflict(&self) {
         self.out_conflict.store(true, Ordering::Release);
     }
 
-    pub fn set_in_conflict(&self) {
+    pub(crate) fn set_in_conflict(&self) {
         self.in_conflict.store(true, Ordering::Release);
     }
 
     /// Whether a concurrent transaction overwrote something this one read.
-    pub fn has_out_conflict(&self) -> bool {
+    pub(crate) fn has_out_conflict(&self) -> bool {
         self.out_conflict.load(Ordering::Acquire)
     }
 
     /// Both edges present: this transaction is a pivot and cannot be allowed to
     /// commit.
-    pub fn is_pivot(&self) -> bool {
+    pub(crate) fn is_pivot(&self) -> bool {
         self.in_conflict.load(Ordering::Acquire) && self.out_conflict.load(Ordering::Acquire)
     }
 
-    pub fn is_committed(&self) -> bool {
+    pub(crate) fn is_committed(&self) -> bool {
         self.committed_at.load(Ordering::Acquire) != 0
     }
 
-    pub fn is_aborted(&self) -> bool {
+    pub(crate) fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::Acquire)
     }
 
-    pub fn mark_committed(&self, ts: Timestamp) {
+    pub(crate) fn mark_committed(&self, ts: Timestamp) {
         self.committed_at.store(ts.raw(), Ordering::Release);
     }
 
-    pub fn mark_aborted(&self) {
+    pub(crate) fn mark_aborted(&self) {
         self.aborted.store(true, Ordering::Release);
     }
 
@@ -128,7 +122,7 @@ impl TxnState {
     /// An aborted transaction's reads never mattered. A committed one's stop
     /// mattering once no live snapshot predates its commit, which is exactly
     /// what the GC watermark tracks.
-    pub fn is_expired(&self, gc_watermark: Timestamp) -> bool {
+    pub(crate) fn is_expired(&self, gc_watermark: Timestamp) -> bool {
         if self.is_aborted() {
             return true;
         }
@@ -144,38 +138,23 @@ impl TxnState {
 /// Deliberately a `Vec`: read sets per slot are almost always tiny, and a
 /// linear scan over a handful of `Arc`s beats a hash set's allocation.
 #[derive(Default, Debug)]
-pub struct Readers(Vec<Arc<TxnState>>);
+pub(crate) struct Readers(Vec<Arc<TxnState>>);
 
 impl Readers {
     /// Register `state` as having read this slot, if it is not already there.
-    pub fn register(&mut self, state: &Arc<TxnState>) {
+    pub(crate) fn register(&mut self, state: &Arc<TxnState>) {
         if !self.0.iter().any(|r| Arc::ptr_eq(r, state)) {
             self.0.push(Arc::clone(state));
         }
     }
 
-    /// Drop expired entries, then report whether anyone other than `writer`
-    /// still holds a lock here.
+    /// Drop expired entries, then return every live reader other than `writer`.
     ///
     /// Purging happens here rather than on a timer because this is the only
     /// place the list is walked, so the work is already paid for.
-    pub fn has_other_reader(&mut self, writer: TxnId, gc_watermark: Timestamp) -> bool {
-        self.0.retain(|r| !r.is_expired(gc_watermark));
-        self.0.iter().any(|r| r.id != writer)
-    }
-
-    /// Every live reader other than `writer`.
-    pub fn others(&mut self, writer: TxnId, gc_watermark: Timestamp) -> Vec<Arc<TxnState>> {
+    pub(crate) fn others(&mut self, writer: TxnId, gc_watermark: Timestamp) -> Vec<Arc<TxnState>> {
         self.0.retain(|r| !r.is_expired(gc_watermark));
         self.0.iter().filter(|r| r.id != writer).cloned().collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -184,7 +163,14 @@ mod tests {
     use super::*;
 
     fn state(id: u64) -> Arc<TxnState> {
-        TxnState::new(TxnId(id), Timestamp(0))
+        TxnState::new(TxnId(id))
+    }
+
+    /// Live readers other than `writer`. `others` is the only accessor the
+    /// engine uses, so the tests go through it too rather than through helpers
+    /// that exist for their benefit alone.
+    fn live(readers: &mut Readers, writer: TxnId) -> Vec<Arc<TxnState>> {
+        readers.others(writer, Timestamp(0))
     }
 
     #[test]
@@ -223,20 +209,24 @@ mod tests {
         let mut readers = Readers::default();
         let a = state(1);
         let b = state(2);
-        assert!(readers.is_empty(), "no readers initially");
+        assert!(
+            live(&mut readers, TxnId::NONE).is_empty(),
+            "no readers initially"
+        );
         readers.register(&a);
         readers.register(&a);
         readers.register(&b);
-        assert_eq!(readers.len(), 2, "duplicate registration");
-
-        assert!(
-            readers.has_other_reader(TxnId(1), Timestamp(0)),
-            "b reads it"
+        assert_eq!(
+            live(&mut readers, TxnId::NONE).len(),
+            2,
+            "duplicate registration"
         );
-        assert!(readers.has_other_reader(TxnId(3), Timestamp(0)));
+
+        assert!(!live(&mut readers, TxnId(1)).is_empty(), "b reads it");
+        assert!(!live(&mut readers, TxnId(3)).is_empty());
 
         // With b expired, only the writer's own read remains.
         b.mark_aborted();
-        assert!(!readers.has_other_reader(TxnId(1), Timestamp(0)));
+        assert!(live(&mut readers, TxnId(1)).is_empty());
     }
 }

@@ -61,7 +61,7 @@ impl TxnId {
 
 /// Decoded form of a version's tagged `begin`/`end` field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Visibility {
+pub(crate) enum Visibility {
     /// The version was committed at this timestamp.
     CommittedAt(Timestamp),
     /// The version is still being written by this transaction. Only that
@@ -73,7 +73,7 @@ pub enum Visibility {
 impl Visibility {
     /// Decode a raw tagged field read out of a version record.
     #[inline]
-    pub const fn decode(raw: u64) -> Visibility {
+    pub(crate) const fn decode(raw: u64) -> Visibility {
         if raw & IN_FLIGHT != 0 {
             Visibility::InFlight(TxnId(raw & ID_MASK))
         } else {
@@ -89,7 +89,7 @@ impl Visibility {
     /// one place is what makes the four isolation levels differ only in *which
     /// snapshot they pass in*, not in how visibility is computed.
     #[inline]
-    pub fn reached(self, snapshot: Timestamp, reader: TxnId) -> bool {
+    pub(crate) fn reached(self, snapshot: Timestamp, reader: TxnId) -> bool {
         match self {
             Visibility::CommittedAt(ts) => ts <= snapshot,
             Visibility::InFlight(id) => id == reader,

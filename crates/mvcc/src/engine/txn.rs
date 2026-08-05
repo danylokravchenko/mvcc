@@ -6,14 +6,14 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mvcc_core::{
+use crate::core::{
     Encodable, Error, IndexKey, IsolationLevel, Result, Timestamp, TxnId, Versioned, Visibility,
 };
 
 use crossbeam_epoch::{Guard, Owned, Shared};
 
-use crate::ssi::TxnState;
-use crate::store::{Database, Slot, Table, Version};
+use crate::engine::ssi::TxnState;
+use crate::engine::store::{Database, Slot, Table, Version};
 
 /// A write this transaction has installed but not yet committed.
 ///
@@ -291,14 +291,14 @@ fn writers_of_change<T: Versioned>(
 ///
 /// `I` is a typestate: `Transaction<'_, ReadCommitted>` and
 /// `Transaction<'_, Serializable>` are different types with different generated
-/// code. See `mvcc_core::isolation`.
+/// code. See `crate::core::isolation`.
 pub struct Transaction<'db, I: IsolationLevel> {
     db: &'db Database,
     id: TxnId,
     snapshot: Timestamp,
     /// Shared with other transactions, which set this one's conflict flags.
     /// Outlives the `Transaction`: SIREAD locks and version records keep
-    /// referring to it after commit. See [`crate::ssi`].
+    /// referring to it after commit. See [`crate::engine::ssi`].
     ///
     /// `None` below `Serializable`. Only SSI reads these flags, so allocating
     /// one per transaction at every level meant a `malloc` and `free` on the
@@ -313,7 +313,7 @@ pub struct Transaction<'db, I: IsolationLevel> {
     ///
     /// The cost is the same shape as the GC watermark's: a long-running
     /// transaction holds an epoch and defers reclamation for everyone. That is
-    /// the failure mode `crate::gc` already documents, now with a second way to
+    /// the failure mode `crate::engine::gc` already documents, now with a second way to
     /// trigger it.
     ///
     /// Declared last so it drops last: the read and write sets hold addresses
@@ -346,7 +346,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         Transaction {
             id,
             snapshot,
-            state: I::VALIDATES_READS.then(|| TxnState::new(id, snapshot)),
+            state: I::VALIDATES_READS.then(|| TxnState::new(id)),
             db,
             writes: Vec::new(),
             reads: Vec::new(),

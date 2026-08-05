@@ -41,7 +41,7 @@
 //! # Locks
 //!
 //! `parking_lot` rather than `std::sync`, for the reasons measured in
-//! `crate::oracle`. The `RwLock`s in this file benefit far less than the oracle's
+//! `crate::engine::oracle`. The `RwLock`s in this file benefit far less than the oracle's
 //! mutexes do — their contention is spread across many slots rather than
 //! concentrated on one — but using one lock type throughout is worth more than
 //! the handful of bytes a split would save.
@@ -60,24 +60,24 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
-use mvcc_core::{
+use crate::core::{
     Error, IndexKey, IsolationLevel, Result, Snapshot as SnapshotLevel, TableId, Timestamp, TxnId,
     Versioned, Visibility,
 };
 
 use crossbeam_epoch::{Atomic, Guard, Shared};
 
-use crate::hash::FxBuildHasher;
-use crate::oracle::{Oracle, OracleConfig};
-use crate::ssi::{Readers, TxnState};
-use crate::txn::Transaction;
+use crate::engine::hash::FxBuildHasher;
+use crate::engine::oracle::{Oracle, OracleConfig};
+use crate::engine::ssi::{Readers, TxnState};
+use crate::engine::txn::Transaction;
 
 /// One version of a record.
 ///
 /// `value` is `None` for a tombstone: a delete installs a version like any
 /// other write, so that a reader at an older snapshot still finds the record
 /// alive behind it.
-pub struct Version<T> {
+pub(crate) struct Version<T> {
     pub(crate) begin: AtomicU64,
     pub(crate) end: AtomicU64,
     /// The version this one displaced. Written once at construction.
@@ -104,7 +104,7 @@ impl<T> Version<T> {
 /// The stable identity of a logical record. Index entries point here, so they
 /// survive every update.
 #[repr(align(64))] // own cache line: `lock` is contended
-pub struct Slot<T> {
+pub(crate) struct Slot<T> {
     /// Head of the version chain.
     ///
     /// An epoch-managed `Atomic`, so a reader follows the chain by plain
@@ -190,8 +190,7 @@ const SLOT_SHARDS: usize = 64;
 
 type SlotShard<T> = RwLock<HashMap<<T as Versioned>::Key, Arc<Slot<T>>, FxBuildHasher>>;
 
-pub struct Table<T: Versioned> {
-    id: TableId,
+pub(crate) struct Table<T: Versioned> {
     /// Primary key to slot, sharded by key hash. See [`SLOT_SHARDS`].
     slots: Box<[SlotShard<T>]>,
     /// One per `#[mvcc(index)]` field, in declaration order.
@@ -247,9 +246,8 @@ struct PredicateLock<T> {
 }
 
 impl<T: Versioned> Table<T> {
-    fn new(id: TableId) -> Self {
+    fn new() -> Self {
         Table {
-            id,
             slots: (0..SLOT_SHARDS)
                 .map(|_| RwLock::new(HashMap::default()))
                 .collect(),
@@ -261,12 +259,8 @@ impl<T: Versioned> Table<T> {
         }
     }
 
-    pub fn id(&self) -> TableId {
-        self.id
-    }
-
     fn shard(&self, key: &T::Key) -> &SlotShard<T> {
-        &self.slots[(crate::hash::hash_one(key) as usize) % SLOT_SHARDS]
+        &self.slots[(crate::engine::hash::hash_one(key) as usize) % SLOT_SHARDS]
     }
 
     /// Borrow the slot for `key`, for as long as the table is borrowed.
@@ -573,9 +567,9 @@ impl Database {
         self.commit_lock.lock()
     }
 
-    /// Snapshot of engine statistics. See [`crate::gc`] for what to watch.
-    pub fn stats(&self) -> crate::gc::GcStats {
-        crate::gc::GcStats {
+    /// Snapshot of engine statistics. See [`crate::engine::gc`] for what to watch.
+    pub fn stats(&self) -> crate::engine::gc::GcStats {
+        crate::engine::gc::GcStats {
             pending_reclaim: 0,
             reclaimed_total: 0,
             watermark: self.oracle.gc_watermark(),
@@ -599,7 +593,7 @@ impl Database {
         // Fails only if another thread won the race; either way the cell now
         // holds a valid id for this type.
         let _ = T::table_id_cell().set(id);
-        tables.insert(type_id, Arc::new(Table::<T>::new(T::table_id())));
+        tables.insert(type_id, Arc::new(Table::<T>::new()));
         Ok(())
     }
 

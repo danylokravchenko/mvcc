@@ -1,11 +1,11 @@
 //! Multi-version concurrency control for ordinary Rust structs.
 //!
 //! Add `#[derive(Mvcc)]` to a struct and it becomes a transactional, versioned,
-//! crash-recoverable table. Readers never block writers and writers never block
-//! readers.
+//! in-memory table. Readers never block writers and writers never block readers.
+//! Nothing is written to disk — see [What this is not](#what-this-is-not).
 //!
-//! ```ignore
-//! use mvcc::{Database, Config, Mvcc, Serializable};
+//! ```
+//! use mvcc::{Config, Database, Mvcc, Serializable};
 //!
 //! #[derive(Mvcc, Clone, Debug)]
 //! #[mvcc(table = "accounts")]
@@ -29,10 +29,11 @@
 //! // concurrent transfers can each read a balance the other is about to
 //! // change (write skew).
 //! db.transaction_with::<Serializable, _, _>(|tx| {
-//!     tx.update(&1, |a| a.balance -= 50)?;
-//!     tx.update(&2, |a| a.balance += 50)?;
+//!     tx.update::<Account>(&1, |a| a.balance -= 50)?;
+//!     tx.update::<Account>(&2, |a| a.balance += 50)?;
 //!     Ok(())
 //! })?;
+//! # Ok::<(), mvcc::Error>(())
 //! ```
 //!
 //! # Choosing an isolation level
@@ -66,33 +67,38 @@
 
 #![doc(html_no_source)]
 
-pub use mvcc_core::{
+// Both modules are private: everything users touch is re-exported below, so the
+// internal layout can change without it being a breaking change.
+mod core;
+mod engine;
+
+pub use crate::core::{
     Error, IsolationLevel, ReadCommitted, RepeatableRead, Result, Serializable, Snapshot,
     Timestamp, TxnId, Versioned,
 };
-pub use mvcc_engine::store::Config;
-pub use mvcc_engine::{Database, Transaction};
+pub use crate::engine::store::Config;
+pub use crate::engine::txn::Ref;
+pub use crate::engine::{Database, Transaction};
 
 #[cfg(feature = "derive")]
-pub use mvcc_macros::Mvcc;
+pub use mvcc_derive::Mvcc;
 
-/// Tuning knobs. Re-exported so users need not depend on the internal crates.
+/// Tuning knobs.
 pub mod config {
-    pub use mvcc_engine::oracle::OracleConfig;
+    pub use crate::engine::oracle::OracleConfig;
 }
 
-/// Runtime statistics. Watch `watermark` and `active_transactions` — see
-/// [`mvcc_engine::gc`] for why.
+/// Runtime statistics. Watch `watermark` and `active_transactions` — see the
+/// [garbage collection](crate::stats::GcStats) notes for why.
 pub mod stats {
-    pub use mvcc_engine::gc::GcStats;
+    pub use crate::engine::gc::GcStats;
 }
 
 /// Used by `#[derive(Mvcc)]`. Not a stable API.
 ///
-/// Generated code refers to everything through this module so that a user only
-/// has to depend on `mvcc`, never on the internal crates, and so that renaming
-/// an internal path is not a breaking change.
+/// Generated code refers to everything through this module so that renaming an
+/// internal path is not a breaking change.
 #[doc(hidden)]
 pub mod __private {
-    pub use mvcc_core::{Encodable, IndexDesc, IndexKey, TableId, Versioned};
+    pub use crate::core::{Encodable, IndexDesc, IndexKey, TableId, Versioned};
 }

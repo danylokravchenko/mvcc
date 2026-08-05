@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use crate::schema::{IndexDesc, IndexKey, TableId};
+use crate::core::schema::{IndexDesc, IndexKey, TableId};
 
 /// A struct that the engine can store and version.
 ///
