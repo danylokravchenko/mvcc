@@ -26,3 +26,35 @@ codegen-units = 1
 
 [profile.bench]
 debug = true
+
+# Inherited by every member via `[lints] workspace = true`.
+#
+# This is deliberately not `clippy::pedantic` wholesale: on an epoch-based
+# lock-free engine that group is ~150 warnings of `cast_possible_truncation`
+# and `ref_as_ptr` on code that is that way on purpose, and a lint set nobody
+# can keep at zero stops being a signal. What is enabled instead is every lint
+# that `clippy.toml` sets a threshold for — otherwise that file is decoration —
+# plus the structural ones this codebase already satisfies.
+[workspace.lints.rust]
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Complexity budgets; thresholds in clippy.toml.
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+struct_excessive_bools = "warn"
+fn_params_excessive_bools = "warn"
+many_single_char_names = "warn"
+struct_field_names = "warn"
+
+# Literal readability; thresholds in clippy.toml.
+unreadable_literal = "warn"
+decimal_literal_representation = "warn"
+large_stack_arrays = "warn"
+
+# Correctness-adjacent pedantic lints that matter for a concurrency crate.
+doc_markdown = "warn"
+redundant_closure_for_method_calls = "warn"
+explicit_iter_loop = "warn"
+match_same_arms = "warn"
+needless_pass_by_value = "warn"

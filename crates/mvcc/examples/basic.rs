@@ -54,7 +54,6 @@ fn main() -> Result<()> {
     let mut tx = db.begin();
     let ada = tx.get::<Account>(&1)?.expect("just inserted");
     println!("ada: branch {}, balance {}", ada.branch, ada.balance);
-    drop(ada);
 
     // A read-only transaction has nothing to commit; dropping it rolls back,
     // which for a reader means simply releasing its snapshot.

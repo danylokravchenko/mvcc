@@ -486,7 +486,10 @@ fn dropping_a_database_frees_every_version() -> Result<()> {
         // chain and only the head is reachable by a reader.
         db.transaction(|tx| {
             for id in 0..100 {
-                tx.insert(Row { id, payload: Tracked(Arc::clone(&drops)) })?;
+                tx.insert(Row {
+                    id,
+                    payload: Tracked(Arc::clone(&drops)),
+                })?;
             }
             Ok(())
         })?;

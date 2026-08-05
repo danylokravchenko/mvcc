@@ -7,9 +7,10 @@
 //! roughly thirty nanoseconds, that was most of the budget.
 //!
 //! Primary keys here come from the application's own records, not from the
-//! network, so the collision-resistance SipHash buys is not doing any work. This
-//! is the same trade `rustc` makes for its own interning tables, and this is the
-//! same construction (FxHash): multiply-xor-rotate, a few instructions per word.
+//! network, so the collision-resistance `SipHash` buys is not doing any work.
+//! This is the same trade `rustc` makes for its own interning tables, and this
+//! is the same construction (`FxHash`): multiply-xor-rotate, a few instructions
+//! per word.
 //!
 //! It is deliberately *not* exposed in the public API. If a caller ever needs
 //! adversarial-input resistance for its keys, the answer is to make the map's
@@ -17,11 +18,11 @@
 
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// The odd multiplier from FxHash — the fractional bits of the golden ratio.
+/// The odd multiplier from `FxHash` — the fractional bits of the golden ratio.
 const SEED: u64 = 0x517c_c1b7_2722_0a95;
 
 #[derive(Default, Clone, Copy)]
-pub struct FxHasher {
+pub(crate) struct FxHasher {
     hash: u64,
 }
 
@@ -44,7 +45,9 @@ impl Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {
         let mut chunks = bytes.chunks_exact(8);
         for chunk in &mut chunks {
-            self.add(u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes")));
+            self.add(u64::from_le_bytes(
+                chunk.try_into().expect("chunk is 8 bytes"),
+            ));
         }
         let rest = chunks.remainder();
         if !rest.is_empty() {
@@ -103,11 +106,11 @@ impl Hasher for FxHasher {
     }
 }
 
-pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// Hash one key, for shard selection.
 #[inline]
-pub fn hash_one<K: std::hash::Hash + ?Sized>(key: &K) -> u64 {
+pub(crate) fn hash_one<K: std::hash::Hash + ?Sized>(key: &K) -> u64 {
     let mut hasher = FxHasher::default();
     key.hash(&mut hasher);
     hasher.finish()

@@ -225,7 +225,7 @@ impl<T: Versioned> Drop for Table<T> {
         // chains can be freed directly rather than deferred. `unprotected` is
         // exactly the escape hatch for that situation.
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        for shard in self.slots.iter_mut() {
+        for shard in &mut self.slots {
             for slot in shard.get_mut().values() {
                 let mut cur = slot.latest.swap(Shared::null(), Ordering::Relaxed, guard);
                 while !cur.is_null() {
@@ -385,20 +385,20 @@ impl<T: Versioned> Table<T> {
     pub(crate) fn matching_in_index<'g>(
         &self,
         position: usize,
-        lo: Bound<IndexKey>,
-        hi: Bound<IndexKey>,
+        lo: &Bound<IndexKey>,
+        hi: &Bound<IndexKey>,
         snapshot: Timestamp,
         reader: TxnId,
         guard: &'g Guard,
     ) -> Vec<(T::Key, &'g Version<T>)> {
         let desc = &T::indexes()[position];
         let in_range = |k: &IndexKey| {
-            let lo_ok = match &lo {
+            let lo_ok = match lo {
                 Bound::Included(b) => k >= b,
                 Bound::Excluded(b) => k > b,
                 Bound::Unbounded => true,
             };
-            let hi_ok = match &hi {
+            let hi_ok = match hi {
                 Bound::Included(b) => k <= b,
                 Bound::Excluded(b) => k < b,
                 Bound::Unbounded => true,
@@ -520,9 +520,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            shards: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
+            shards: std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             oracle: Default::default(),
         }
     }
@@ -554,6 +552,10 @@ pub struct Database {
 }
 
 impl Database {
+    // Takes `Config` by value even though only `oracle` is read out of it: this
+    // is the public constructor, and handing ownership over is what lets fields
+    // be added later without changing the signature.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn open(config: Config) -> Result<Self> {
         Ok(Database {
             oracle: Oracle::new(config.oracle),

@@ -198,7 +198,9 @@ struct PredicateRead<'db, T: Versioned> {
 
 impl<'db, T: Versioned> ReadValidation<'db> for PredicateRead<'db, T> {
     fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation {
-        let current = self.table.matching(now, TxnId::NONE, &*self.predicate, guard);
+        let current = self
+            .table
+            .matching(now, TxnId::NONE, &*self.predicate, guard);
         writers_of_change(self.table, &self.observed, &current, now, guard)
     }
 }
@@ -219,8 +221,8 @@ impl<'db, T: Versioned> ReadValidation<'db> for IndexRangeRead<'db, T> {
     fn revalidate(&self, now: Timestamp, guard: &Guard) -> Revalidation {
         let current = self.table.matching_in_index(
             self.position,
-            self.lo.clone(),
-            self.hi.clone(),
+            &self.lo,
+            &self.hi,
             now,
             TxnId::NONE,
             guard,
@@ -751,11 +753,11 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         let lo = encode_bound(range.start_bound());
         let hi = encode_bound(range.end_bound());
 
-        let matched = table.matching_in_index(position, lo.clone(), hi.clone(), snapshot, self.id, &self.guard);
+        let matched = table.matching_in_index(position, &lo, &hi, snapshot, self.id, &self.guard);
 
         if I::VALIDATES_READS {
             let observed: Vec<(T::Key, usize)> = table
-                .matching_in_index(position, lo.clone(), hi.clone(), snapshot, TxnId::NONE, &self.guard)
+                .matching_in_index(position, &lo, &hi, snapshot, TxnId::NONE, &self.guard)
                 .iter()
                 .map(|(k, v)| (k.clone(), *v as *const Version<T> as usize))
                 .collect();

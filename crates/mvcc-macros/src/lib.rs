@@ -58,7 +58,7 @@ use syn::{
 #[proc_macro_derive(Mvcc, attributes(mvcc))]
 pub fn derive_mvcc(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    expand(input)
+    expand(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -106,7 +106,7 @@ fn parse_field_opts(field: &Field) -> syn::Result<FieldOpts> {
     Ok(opts)
 }
 
-fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
+fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let ty = &input.ident;
 
     // --- struct-level attributes -------------------------------------------

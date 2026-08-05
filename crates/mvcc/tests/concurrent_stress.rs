@@ -30,7 +30,11 @@ const KEYS: u64 = 8;
 fn seeded(db: &Database) -> Result<()> {
     db.transaction(|tx| {
         for id in 0..KEYS {
-            tx.insert(Row { id, value: 0, label: format!("row-{id}") })?;
+            tx.insert(Row {
+                id,
+                value: 0,
+                label: format!("row-{id}"),
+            })?;
         }
         Ok(())
     })
@@ -112,8 +116,14 @@ fn readers_survive_writers_aborting_underneath_them() -> Result<()> {
         r.join().expect("reader panicked")?;
     }
 
-    assert!(aborts.load(Ordering::Relaxed) > 100, "too few aborts to be meaningful");
-    assert!(reads.load(Ordering::Relaxed) > 100, "too few reads to be meaningful");
+    assert!(
+        aborts.load(Ordering::Relaxed) > 100,
+        "too few aborts to be meaningful"
+    );
+    assert!(
+        reads.load(Ordering::Relaxed) > 100,
+        "too few reads to be meaningful"
+    );
     Ok(())
 }
 
@@ -125,7 +135,11 @@ fn contended_serializable_transfers_conserve_and_terminate() -> Result<()> {
     db.register::<Row>()?;
     db.transaction(|tx| {
         for id in 0..KEYS {
-            tx.insert(Row { id, value: 1_000, label: format!("row-{id}") })?;
+            tx.insert(Row {
+                id,
+                value: 1_000,
+                label: format!("row-{id}"),
+            })?;
         }
         Ok(())
     })?;
@@ -143,7 +157,7 @@ fn contended_serializable_transfers_conserve_and_terminate() -> Result<()> {
                     if from == to {
                         continue;
                     }
-                    match db.transaction_with::<Serializable, _, _>(|tx| {
+                    let outcome = db.transaction_with::<Serializable, _, _>(|tx| {
                         let balance = tx.get::<Row>(&from)?.map(|r| r.value).unwrap_or(0);
                         if balance < 10 {
                             return Ok(());
@@ -151,12 +165,15 @@ fn contended_serializable_transfers_conserve_and_terminate() -> Result<()> {
                         tx.update::<Row>(&from, |r| r.value -= 10)?;
                         tx.update::<Row>(&to, |r| r.value += 10)?;
                         Ok(())
-                    }) {
-                        Ok(()) => {}
+                    });
+                    if let Err(e) = outcome {
                         // Retries are bounded, so exhausting them under this
-                        // much contention is a legitimate outcome.
-                        Err(Error::SerializationFailure | Error::WriteConflict { .. }) => {}
-                        Err(e) => return Err(e),
+                        // much contention is a legitimate outcome; anything
+                        // else is a real failure.
+                        match e {
+                            Error::SerializationFailure | Error::WriteConflict { .. } => {}
+                            e => return Err(e),
+                        }
                     }
                 }
                 Ok(())

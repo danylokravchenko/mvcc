@@ -134,6 +134,10 @@ fn act(n: u32, title: &str) {
     println!("\n\x1b[1m── Act {n}. {title}\x1b[0m");
 }
 
+// A narrative example: one linear script of acts, read top to bottom. Splitting
+// it into helpers to satisfy the length and complexity budgets would make it
+// harder to follow, which is the only thing this file is for.
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn main() -> Result<()> {
     let db = Arc::new(Database::open(Config::in_memory())?);
     db.register::<Hero>()?;
@@ -184,7 +188,6 @@ fn main() -> Result<()> {
         item(20, GROUND, "Flaming Greatsword", 55, 500, Kind::Weapon)?;
         item(21, GROUND, "Elven Cloak", 20, 240, Kind::Trinket)?;
         item(22, GROUND, "Iron Helm", 35, 60, Kind::Weapon)?;
-        drop(item);
 
         // Arbitrary per-item state, in a database row, with no schema to
         // declare and no serialisation format to agree on.
@@ -275,7 +278,6 @@ fn main() -> Result<()> {
         move |tx: &mut mvcc::Transaction<'_, Serializable>| -> Result<bool> {
             let hero = tx.get::<Hero>(&cleo)?.expect("Cleo exists");
             let strength = hero.strength;
-            drop(hero);
             let load = carried(tx, cleo)?;
             let weight = tx.get::<Item>(&item)?.map(|i| i.weight).unwrap_or(0);
             if load + weight > strength {
@@ -593,8 +595,8 @@ fn main() -> Result<()> {
     drop(tx);
 
     println!(
-        "  {:<6} {:>6} {:>5} {:>7}  {}",
-        "hero", "gold", "load", "worth", "inventory"
+        "  {:<6} {:>6} {:>5} {:>7}  inventory",
+        "hero", "gold", "load", "worth"
     );
     let mut tx = db.begin();
     for (id, name, gold) in &roster {
@@ -621,16 +623,22 @@ fn main() -> Result<()> {
     // and `kind` is an ordinary Rust enum the engine knows nothing about.
     let potions = tx.scan_where::<Item, _>(|i| i.kind == Kind::Potion)?.len();
     let sword = tx.get::<Item>(&20)?.expect("greatsword");
-    let enchantment = sword.flavour.get("enchantment").cloned().unwrap_or_default();
+    let enchantment = sword
+        .flavour
+        .get("enchantment")
+        .cloned()
+        .unwrap_or_default();
     let forged_by = sword.flavour.get("forged_by").cloned().unwrap_or_default();
-    drop(sword);
     drop(tx);
     // The rule Act 3 was about, checked rather than asserted in prose.
     let mut tx = db.begin();
     for (id, name, _) in &roster {
         let strength = tx.get::<Hero>(id)?.map(|h| h.strength).unwrap_or(0);
         let load = carried(&mut tx, *id)?;
-        assert!(load <= strength, "{name} is over their carry limit: {load} > {strength}");
+        assert!(
+            load <= strength,
+            "{name} is over their carry limit: {load} > {strength}"
+        );
     }
     drop(tx);
 

@@ -7,7 +7,8 @@
 //!
 //! Three workloads, deliberately separated so a result points at a cause:
 //!
-//! - **point reads** — `tables` RwLock, `slots` RwLock, `Slot::latest` RwLock.
+//! - **point reads** — the `tables` `RwLock`, the `slots` `RwLock`, and an
+//!   atomic load of `Slot::latest`.
 //!   One transaction per 100 reads, so per-transaction costs amortise away.
 //! - **point reads (hot)** — the same, but every thread on the same four rows.
 //!   Uniform keys leave per-slot synchronisation uncontended and therefore
@@ -72,11 +73,7 @@ fn main() -> Result<()> {
         .skip(1)
         .find(|a| !a.starts_with('-'))
         .and_then(|a| a.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        });
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, std::num::NonZero::get));
 
     let db = Arc::new(Database::open(Config::in_memory())?);
     db.register::<Row>()?;

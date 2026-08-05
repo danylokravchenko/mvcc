@@ -6,5 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["mvcc", "database", "transactions", "concurrency", "isolation"]
+categories = ["database-implementations", "concurrency"]
 
 [dependencies]
+
+[lints]
+workspace = true

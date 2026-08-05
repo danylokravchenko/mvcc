@@ -1,75 +1,52 @@
-# ------------------------------------------------------------------------------
-# COGNITIVE COMPLEXITY
-# ------------------------------------------------------------------------------
-# Limit function complexity to maintain readability and testability
+# Thresholds for the lint groups enabled in `[workspace.lints]` (root
+# Cargo.toml). A key here only does something if the lint that reads it is on,
+# so this file is deliberately limited to lints `clippy::pedantic` turns on.
+#
+# Note that documentation is enforced by `missing_docs` in `[workspace.lints]`,
+# not from here — the clippy equivalent covers private items too, which this
+# codebase does not want.
+
+# clippy::cognitive_complexity. The engine's commit path is the only thing that
+# comes close; when it exceeds this it wants splitting, not a raised threshold.
 cognitive-complexity-threshold = 15
 
-# ------------------------------------------------------------------------------
-# TYPE COMPLEXITY
-# ------------------------------------------------------------------------------
-# Warn on overly complex type signatures
+# clippy::type_complexity. Version chains are generic over the record type and
+# nest `Atomic<Version<T>>` a few layers deep, so the default (250) is right at
+# the edge; keep it there rather than papering over a genuinely bad signature.
 type-complexity-threshold = 250
 
-# ------------------------------------------------------------------------------
-# DOCUMENTATION
-# ------------------------------------------------------------------------------
-# Enforce documentation for public items
-missing-docs-in-crate-items = true
-
-# ------------------------------------------------------------------------------
-# PERFORMANCE
-# ------------------------------------------------------------------------------
-# Warn on unnecessary allocations and clones
+# clippy::too_many_lines
 too-many-lines-threshold = 200
+
+# clippy::many_single_char_names. Lock-free code legitimately uses short names
+# for pointer temporaries (`p`, `n`, `cur`), but four in one scope is a smell.
 single-char-binding-names-threshold = 4
 
-# ------------------------------------------------------------------------------
-# NAMING CONVENTIONS
-# ------------------------------------------------------------------------------
-# Enforce consistent naming (snake_case, CamelCase, SCREAMING_SNAKE_CASE)
-# These are enforced by default but explicitly listed for clarity
+# clippy::enum_variant_names / struct_field_names — catch a shared prefix that
+# should have been factored into the type name.
 enum-variant-name-threshold = 3
-max-struct-bools = 3
 struct-field-name-threshold = 20
 
-# ------------------------------------------------------------------------------
-# FUNCTION PARAMETERS
-# ------------------------------------------------------------------------------
-too-many-arguments-threshold = 7
+# clippy::struct_excessive_bools / fn_params_excessive_bools. `Config` and
+# `OracleConfig` are the ones at risk; past three, take an enum or a builder.
+max-struct-bools = 3
 max-fn-params-bools = 3
 
-# ------------------------------------------------------------------------------
-# ASYNC/AWAIT
-# ------------------------------------------------------------------------------
-# Ensure proper async patterns in tokio-based code
-# (Most async lints are enabled by default in pedantic/restriction groups)
-future-size-threshold = 16384
+# clippy::too_many_arguments
+too-many-arguments-threshold = 7
 
-# ------------------------------------------------------------------------------
-# SAFETY
-# ------------------------------------------------------------------------------
-# Maximum strictness on unsafe code (should never be used per guidelines)
-# This is enforced through lint groups below
-
-# ------------------------------------------------------------------------------
-# VECTOR OPERATIONS
-# ------------------------------------------------------------------------------
-# Optimize vector usage patterns
+# clippy::vec_box, clippy::large_stack_arrays, clippy::large_const_arrays.
+# The stack thresholds are deliberately generous: the benchmark and the stress
+# tests build large fixed arrays of records on purpose.
 vec-box-size-threshold = 4096
-
-# ------------------------------------------------------------------------------
-# ARRAY AND STACK
-# ------------------------------------------------------------------------------
 array-size-threshold = 512000
 stack-size-threshold = 512000
 
-# ------------------------------------------------------------------------------
-# LITERAL HANDLING
-# ------------------------------------------------------------------------------
+# clippy::unreadable_literal / decimal_literal_representation. Timestamps and
+# transaction ids are compared as raw u64 in tests, and those want separators.
 literal-representation-threshold = 16384
 unreadable-literal-lint-fractions = true
 
-# ------------------------------------------------------------------------------
-# ERROR TYPES
-# ------------------------------------------------------------------------------
+# clippy::result_large_err. `Error` carries a conflict description; keep it
+# small enough that `Result` stays cheap to return from the hot commit path.
 large-error-threshold = 128
