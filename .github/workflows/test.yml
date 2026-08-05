@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96"
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      # The examples are not decoration: each one asserts the invariant it
+      # narrates (gold is conserved, a snapshot does not move, the party stays
+      # under its limit), so a run that exits non-zero is a real engine bug.
+      # Discovered from the directory rather than listed, so a new example is
+      # covered the moment it lands. Debug profile on purpose — clippy above
+      # already built these targets, and none of the assertions are timing
+      # dependent, so there is nothing to buy with a second release build.
+      - name: Run examples
+        run: |
+          failed=0
+          for file in crates/mvcc/examples/*.rs; do
+            name=$(basename "$file" .rs)
+            echo "::group::cargo run --example $name"
+            if ! cargo run -p mvcc --all-features --example "$name"; then
+              echo "::error file=$file::example '$name' failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+      # Broken intra-doc links and unparseable code blocks are warnings by
+      # default, which means they accumulate silently. This crate's public
+      # surface is small and heavily documented, so hold it at zero.
+      - name: Check docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features

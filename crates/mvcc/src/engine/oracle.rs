@@ -113,7 +113,7 @@ pub enum OracleConfig {
     /// Exact and totally ordered, and now a bare `fetch_add` with no lock
     /// behind it. The counter is still a shared cache line, but measurement put
     /// the watermark's compare-exchange well ahead of it as the write path's
-    /// cost — see [`Oracle::publish`].
+    /// cost — see `Oracle::publish`.
     #[default]
     Centralised,
 }

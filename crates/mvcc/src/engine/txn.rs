@@ -656,7 +656,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// afterwards, and that is the entire point under `Serializable`: the
     /// engine records it, re-evaluates it at commit, and aborts if the set of
     /// matching rows changed. That is what makes phantoms visible — see
-    /// [`PredicateRead`] — and it is why
+    /// `PredicateRead` — and it is why
     ///
     /// ```ignore
     /// tx.scan_where::<Account, _>(|a| a.balance < 0)?

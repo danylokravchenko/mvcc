@@ -663,7 +663,7 @@ impl Database {
         self.commit_lock.lock()
     }
 
-    /// Snapshot of engine statistics. See [`crate::engine::gc`] for what to watch.
+    /// Snapshot of engine statistics. See [`crate::stats`] for what to watch.
     pub fn stats(&self) -> crate::engine::gc::GcStats {
         crate::engine::gc::GcStats {
             pending_reclaim: 0,
@@ -762,7 +762,7 @@ impl Database {
     /// Run `f` in a transaction at isolation level `I`, retrying while it fails
     /// retriably, and commit.
     ///
-    /// ```ignore
+    /// ```text
     /// db.transaction_with::<Serializable, _, _>(|tx| { … })?;
     /// ```
     pub fn transaction_with<I, R, F>(&self, mut f: F) -> Result<R>
