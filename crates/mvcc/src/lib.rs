@@ -178,11 +178,20 @@
 //! MVCC systems fall over. [`Database::stats`] exposes the watermark and the
 //! live transaction count; watch them, and see [`stats::GcStats`].
 //!
-//! Two things are deliberately *not* reclaimed. A record's slot is immortal
-//! once created, so a workload that inserts and deletes many **distinct** keys
-//! still grows even though its versions are collected. And reads never trigger
-//! pruning, so a record written once and then only read keeps every version it
-//! had at its last write.
+//! Deleting a record eventually returns everything it held: once the tombstone
+//! is itself below the watermark, the whole chain goes. And records that stop
+//! being written are collected too, by a sweep that rides on other commits — so
+//! a record written once and then only read does not keep its history forever.
+//!
+//! What is **not** reclaimed is the per-key slot: roughly **180 bytes for every
+//! distinct key** the database has ever held, measured with a counting
+//! allocator. That figure is flat in the size of the record — everything that
+//! scales with your type lives in the version, which is freed — so a workload
+//! churning through unboundedly many distinct keys still grows, but at a fixed
+//! cost per key rather than per byte written.
+//!
+//! [`Database::compact`] gives those bytes back. Call it in a
+//! quiet moment if your key space is unbounded.
 //!
 //! # What this is not
 //!

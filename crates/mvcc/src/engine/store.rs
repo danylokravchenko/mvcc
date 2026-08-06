@@ -75,7 +75,7 @@ use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use crate::core::{
     Error, IndexKey, IsolationLevel, Result, Snapshot as SnapshotLevel, TableId, Timestamp, TxnId,
@@ -291,7 +291,29 @@ impl<T> Slot<T> {
     /// because `gc` is a minimum over live snapshots and everything below the
     /// cut ended at or before it.
     pub(crate) fn prune(&self, gc: Timestamp, guard: &Guard) {
-        let mut cur = self.latest.load(Ordering::Acquire, guard);
+        let head = self.latest.load(Ordering::Acquire, guard);
+
+        // A deleted record whose tombstone is itself below the watermark has no
+        // live version left at all: every reader now takes its snapshot at or
+        // after the delete, so all of them see the record as absent. Detaching
+        // the head empties the slot and frees the record's data, which is the
+        // part that scales with `T`.
+        //
+        // Emptying rather than *removing* is the whole of what is possible here.
+        // `SlotMap::get` hands out a `&Slot<T>` borrowed from the map, not from
+        // the guard, which is sound only because records outlive every epoch —
+        // so the `Record` and its key stay. A later insert of the same key finds
+        // this slot again through `slot_or_create` and refills it.
+        if let Some(v) = unsafe { head.as_ref() }
+            && v.value.is_none()
+            && Self::began_at_or_before(v, gc)
+        {
+            self.latest.store(Shared::null(), Ordering::Release);
+            Self::retire_chain(head, guard);
+            return;
+        }
+
+        let mut cur = head;
         for _ in 0..Self::PRUNE_PROBE {
             // SAFETY: reachable from `latest` during this pin, so still alive —
             // the same argument as `Slot::read`.
@@ -309,21 +331,82 @@ impl<T> Slot<T> {
             }
 
             v.prev.store(Shared::null(), Ordering::Release);
-
-            // Retire each node individually. `Atomic` does not own its target,
-            // so dropping a version does not drop the chain hanging off it —
-            // freeing only the head of the suffix would leak the rest.
-            let mut doomed = next;
-            while let Some(d) = unsafe { doomed.as_ref() } {
-                let following = d.prev.load(Ordering::Acquire, guard);
-                // SAFETY: unlinked above and unreachable from `latest`, so no
-                // new reader can find it. `defer_destroy` runs the drop only
-                // once every thread pinned at retirement has unpinned, which
-                // covers readers that loaded the pointer before the store.
-                unsafe { guard.defer_destroy(doomed) };
-                doomed = following;
-            }
+            Self::retire_chain(next, guard);
             return;
+        }
+    }
+
+    /// Whether [`Slot::prune`] would free anything, decided **without taking the
+    /// lock**.
+    ///
+    /// This exists because the sweep must not simply grab every slot it visits.
+    /// The slot lock is first-updater-wins: a writer that finds it held aborts
+    /// with [`Error::WriteConflict`] rather than waiting, so a sweeper that
+    /// takes locks speculatively makes user transactions fail. Checking first
+    /// means the lock is only taken where there is real work, and a slot with
+    /// nothing to collect is never contended at all.
+    ///
+    /// Deliberately a read-only mirror of `prune`'s decision rather than shared
+    /// code: everything here must stay load-only, and folding the two together
+    /// is how that quietly stops being true.
+    fn needs_prune(&self, gc: Timestamp, guard: &Guard) -> bool {
+        let head = self.latest.load(Ordering::Acquire, guard);
+        // SAFETY: reachable from `latest` during this pin — as in `Slot::read`.
+        let Some(first) = (unsafe { head.as_ref() }) else {
+            return false;
+        };
+        if first.value.is_none() && Self::began_at_or_before(first, gc) {
+            return true;
+        }
+
+        let mut cur = head;
+        for _ in 0..Self::PRUNE_PROBE {
+            let Some(v) = (unsafe { cur.as_ref() }) else {
+                return false;
+            };
+            let next = v.prev.load(Ordering::Acquire, guard);
+            let Some(n) = (unsafe { next.as_ref() }) else {
+                return false;
+            };
+            if Self::ended_at_or_before(n, gc) {
+                return true;
+            }
+            cur = next;
+        }
+        false
+    }
+
+    /// Retire `head` and everything below it.
+    ///
+    /// Each node individually: [`Atomic`] does not own its target, so dropping
+    /// a version does not drop the chain hanging off it — retiring only the
+    /// head of a detached run would leak the rest.
+    ///
+    /// # Safety
+    ///
+    /// `head` must already be unlinked, so that no new reader can reach it.
+    fn retire_chain(head: Shared<'_, Version<T>>, guard: &Guard) {
+        let mut doomed = head;
+        while let Some(d) = unsafe { doomed.as_ref() } {
+            let following = d.prev.load(Ordering::Acquire, guard);
+            // SAFETY: unlinked by the caller, so unreachable from `latest`.
+            // `defer_destroy` runs the drop only once every thread pinned at
+            // retirement has unpinned, which covers readers that loaded the
+            // pointer before the store that unlinked it.
+            unsafe { guard.defer_destroy(doomed) };
+            doomed = following;
+        }
+    }
+
+    /// Whether `v` became visible at or before `gc`, so that every live and
+    /// future reader takes its snapshot at or after it.
+    ///
+    /// Used only for tombstones: an in-flight `begin` is a delete that has not
+    /// committed, whose version nobody else may act on.
+    fn began_at_or_before(v: &Version<T>, gc: Timestamp) -> bool {
+        match Visibility::decode(v.begin.load(Ordering::Acquire)) {
+            Visibility::CommittedAt(ts) => ts <= gc,
+            Visibility::InFlight(_) => false,
         }
     }
 
@@ -336,14 +419,27 @@ impl<T> Slot<T> {
     /// on one hot row: 2.3µs per update at 2k updates, 39µs at 32k, against a
     /// flat 0.3µs unpinned.
     ///
-    /// A small bound loses nothing, because the cut point is only ever *near
-    /// the head* when there is anything to collect. Refreshing
+    /// A small bound costs little, because the cut point is only ever *near the
+    /// head* when there is anything to collect. Refreshing
     /// [`Database::gc_hint`] jumps the watermark to the present, which puts the
     /// boundary within a couple of versions; between refreshes the chain grows
     /// and the probe cheaply fails, then the next refresh collects the whole
-    /// backlog in one cut. What this gives up is pruning a chain whose live
-    /// prefix is genuinely longer than this — which means readers are holding
-    /// it, and the versions could not be freed anyway.
+    /// backlog in one cut.
+    ///
+    /// It is not free, though. A chain whose live prefix is longer than this is
+    /// skipped, and the prefix is long whenever the hint lags — not only when a
+    /// reader is genuinely holding versions. So a steady residual is retained
+    /// per record, proportional to how many commits that record takes between
+    /// refreshes. Measured after 20,000 updates with no readers at all:
+    ///
+    /// ```text
+    ///   one hot row      35 versions retained
+    ///   ten rows          5
+    ///   a hundred rows    3
+    /// ```
+    ///
+    /// Bounded and small, and the trade is deliberate: the alternative is the
+    /// quadratic scan above.
     const PRUNE_PROBE: usize = 8;
 
     /// Whether `v` was superseded at or before `gc`, and so is invisible to
@@ -370,6 +466,27 @@ impl<T> Slot<T> {
 type Matches<'g, T> = Vec<(<T as Versioned>::Key, &'g Version<T>)>;
 
 /// A registered table: the primary map plus any secondary indexes.
+/// Pruning a table without naming its record type.
+///
+/// [`Database::tables`] is type-erased, so the sweep that collects records
+/// nobody is writing cannot call [`Slot::prune`] directly. This is the one
+/// operation it needs, in a form the registry can hold.
+pub(crate) trait Sweep: Send + Sync {
+    /// Prune the slots of one shard, chosen by `round`.
+    ///
+    /// `sweeper` is the id the slot lock is taken under. It must belong to a
+    /// transaction that currently holds no other lock on these slots.
+    fn sweep_shard(&self, round: usize, gc: Timestamp, sweeper: TxnId);
+
+    /// Reclaim the records of deleted keys, and everything that referred to
+    /// them. Returns how many were freed.
+    ///
+    /// **The caller must hold `&mut Database`** — see
+    /// [`SlotMap::compact`](crate::engine::slotmap::SlotMap::compact) for why
+    /// that, and not the `&self` here, is the safety argument.
+    fn compact(&self) -> usize;
+}
+
 pub(crate) struct Table<T: Versioned> {
     /// Primary key to slot. Lock-free on the read path — see [`SlotMap`].
     slots: SlotMap<T>,
@@ -459,6 +576,54 @@ impl<T: Versioned> Drop for Table<T> {
 struct PredicateLock<T> {
     state: Arc<TxnState>,
     predicate: Arc<dyn Fn(&T) -> bool + Send + Sync>,
+}
+
+impl<T: Versioned> Sweep for Table<T> {
+    fn sweep_shard(&self, round: usize, gc: Timestamp, sweeper: TxnId) {
+        let guard = crossbeam_epoch::pin();
+        self.slots.for_each_in_shard(round, &guard, |record| {
+            // Skip anything a writer holds rather than waiting for it: that
+            // writer prunes the slot itself on its way out, so the work is not
+            // lost, and a sweep must never add contention to the write path.
+            // Check before locking, then skip anything a writer already
+            // holds. Both halves matter: the first keeps the sweep off slots
+            // with nothing to collect, the second keeps it from waiting on one
+            // that is busy — the writer prunes that slot itself on its way out.
+            if record.slot.needs_prune(gc, &guard) && record.slot.try_lock(sweeper) {
+                record.slot.prune(gc, &guard);
+                record.slot.unlock(sweeper);
+            }
+        });
+    }
+
+    fn compact(&self) -> usize {
+        let reclaimed = self.slots.compact();
+
+        // Secondary indexes hold *primary keys*, not slot pointers, so nothing
+        // above dangled — but the entries for reclaimed keys are now candidates
+        // that can never resolve, costing memory and scan time forever. A
+        // candidate survives only if its key still has a record.
+        {
+            let guard = unsafe { crossbeam_epoch::unprotected() };
+            for index in &self.secondary {
+                let mut index = index.write();
+                index.retain(|_, candidates| {
+                    candidates.retain(|key| self.slots.get(key, guard).is_some());
+                    !candidates.is_empty()
+                });
+            }
+        }
+
+        // Both of these only ever hold state belonging to in-flight
+        // transactions, and `&mut self` proves there are none. Anything left is
+        // residue that lazy expiry would have dropped on next touch.
+        self.predicate_locks.lock().clear();
+        for claims in &self.unique_claims {
+            claims.lock().clear();
+        }
+
+        reclaimed
+    }
 }
 
 impl<T: Versioned> Table<T> {
@@ -830,6 +995,14 @@ pub struct Database {
     /// prunes less than it could, never more. `fetch_max` keeps it monotonic so
     /// a delayed thread cannot publish an older reading over a newer one.
     gc_hint: AtomicU64,
+    /// Every registered table, in a form the sweep can call without naming `T`.
+    ///
+    /// Parallel to `tables` rather than replacing it: lookups there are on the
+    /// hot path and go through `TypeId`, while this is walked in order by a
+    /// sweep that runs once per `GC_HINT_INTERVAL` commits.
+    sweepable: RwLock<Vec<Arc<dyn Sweep>>>,
+    /// Which shard the next sweep visits. See [`Database::sweep`].
+    sweep_round: AtomicUsize,
 }
 
 impl Database {
@@ -861,6 +1034,8 @@ impl Database {
             next_table_id: AtomicU16::new(0),
             commit_lock: Mutex::new(()),
             gc_hint: AtomicU64::new(0),
+            sweepable: RwLock::new(Vec::new()),
+            sweep_round: AtomicUsize::new(0),
         })
     }
 
@@ -875,10 +1050,39 @@ impl Database {
     /// Commit timestamps are gap-free — the completion ring depends on it — so
     /// testing the timestamp itself samples at a fixed global rate without
     /// another shared counter to contend on.
-    pub(crate) fn refresh_gc_hint(&self, ts: Timestamp) {
+    pub(crate) fn refresh_gc_hint(&self, ts: Timestamp, sweeper: TxnId) {
         if ts.raw().is_multiple_of(Self::GC_HINT_INTERVAL) {
             let watermark = self.oracle.gc_watermark();
             self.gc_hint.fetch_max(watermark.raw(), Ordering::Relaxed);
+            if ts.raw().is_multiple_of(Self::SWEEP_INTERVAL) {
+                self.sweep(watermark, sweeper);
+            }
+        }
+    }
+
+    /// Prune one shard of every table.
+    ///
+    /// Pruning otherwise only happens where a write happens, which leaves a
+    /// record that is written once and then only read holding whatever versions
+    /// it had at its last write. This is what collects those.
+    ///
+    /// **It runs on the write path, not on a thread and not on reads.** A
+    /// background thread would mean a lifecycle to own and join; pruning from
+    /// reads would put a lock acquisition — a shared write — back onto the read
+    /// path, which is the one property the whole engine is built around. Instead
+    /// the cost rides on a commit that is already paying for `gc_watermark`.
+    ///
+    /// One shard per round, advancing round-robin, so a full pass over the map
+    /// takes `SlotMap::SHARDS` rounds and each round touches about `1/SHARDS` of
+    /// the records. A database with no writes at all sweeps never — and needs
+    /// nothing swept, because nothing is producing versions.
+    fn sweep(&self, gc: Timestamp, sweeper: TxnId) {
+        let round = self.sweep_round.fetch_add(1, Ordering::Relaxed);
+        // Cloned out so the sweep itself runs without the registry lock held:
+        // `table_erased` takes it on every operation.
+        let tables: Vec<Arc<dyn Sweep>> = self.sweepable.read().clone();
+        for table in tables {
+            table.sweep_shard(round, gc, sweeper);
         }
     }
 
@@ -888,6 +1092,22 @@ impl Database {
     /// chains carry at most this many extra versions per record between
     /// refreshes, which is negligible next to the unbounded growth it replaces.
     pub(crate) const GC_HINT_INTERVAL: u64 = 128;
+
+    /// How often to sweep a shard, in commits.
+    ///
+    /// Much rarer than [`Self::GC_HINT_INTERVAL`], and the reason is throughput
+    /// rather than taste. The sweep walks one shard — about `records / SHARDS`
+    /// of them — so tying it to the hint refresh made its cost scale with the
+    /// commit rate: at 2.3M commits/s the refresh fires ~12,500 times a second,
+    /// which turned a cheap-looking walk into ~2M record visits and cost a third
+    /// of serializable write throughput.
+    ///
+    /// Pacing it separately puts the amortised cost near 0.15 record visits per
+    /// commit. A full pass over the map takes `SHARDS * SWEEP_INTERVAL` commits,
+    /// which is the lag on collecting a record nobody writes any more — slow, but
+    /// it is a background concern by definition, and the alternative was making
+    /// every commit pay for it.
+    pub(crate) const SWEEP_INTERVAL: u64 = Self::GC_HINT_INTERVAL * 32;
 
     /// The timestamp oracle.
     ///
@@ -911,6 +1131,55 @@ impl Database {
         }
     }
 
+    /// Reclaim the memory of deleted records, returning how many were freed.
+    ///
+    /// Ordinary reclamation frees a record's *versions* but not its slot: about
+    /// 180 bytes per key stay behind, because the map that resolves a key to a
+    /// slot is append-only, and that is what lets a lookup take no locks and
+    /// write nothing. This is the operation that gives those bytes back.
+    ///
+    /// **It takes `&mut self`, and that is the entire safety argument.** A
+    /// [`Transaction`] borrows the database, so an exclusive borrow is a
+    /// compile-time proof that none exist — which is what makes it sound to free
+    /// a slot some transaction might otherwise have already resolved. There is
+    /// no runtime check to fail and no window to get wrong.
+    ///
+    /// Call it during a quiet moment. Nothing else in the engine needs it, and
+    /// nothing on the read or write path pays for its existence.
+    ///
+    /// ```
+    /// # use mvcc::{Config, Database, Mvcc};
+    /// # #[derive(Mvcc, Clone)]
+    /// # struct Session {
+    /// #     #[mvcc(primary_key)] id: u64,
+    /// #     token: u64,
+    /// # }
+    /// let mut db = Database::open(Config::in_memory())?;
+    /// db.register::<Session>()?;
+    ///
+    /// db.transaction(|tx| tx.insert(Session { id: 1, token: 42 }))?;
+    /// db.transaction(|tx| tx.delete::<Session>(&1))?;
+    ///
+    /// // No transaction may be alive here — the borrow checker enforces it.
+    /// let freed = db.compact();
+    /// # let _ = freed;
+    /// # Ok::<(), mvcc::Error>(())
+    /// ```
+    ///
+    /// Only keys whose records are *gone* are reclaimed — deleted, and their
+    /// tombstone already collected. A record that merely has not been touched in
+    /// a while is untouched. If a delete is very recent its tombstone may still
+    /// be live, in which case that key is reclaimed by a later call rather than
+    /// this one.
+    ///
+    /// It also drops secondary index entries that can no longer resolve. Those
+    /// were never unsafe — an index holds primary keys, not slot pointers — but
+    /// they are dead weight in memory and in every scan that walks them.
+    pub fn compact(&mut self) -> usize {
+        let tables: Vec<Arc<dyn Sweep>> = self.sweepable.read().clone();
+        tables.iter().map(|table| table.compact()).sum()
+    }
+
     /// Register a type. Assigns its [`TableId`] and builds its indexes.
     ///
     /// Must happen before any transaction touches `T`. Registering twice is a
@@ -927,7 +1196,9 @@ impl Database {
         // Fails only if another thread won the race; either way the cell now
         // holds a valid id for this type.
         let _ = T::table_id_cell().set(id);
-        tables.insert(type_id, Arc::new(Table::<T>::new()));
+        let table = Arc::new(Table::<T>::new());
+        self.sweepable.write().push(table.clone() as Arc<dyn Sweep>);
+        tables.insert(type_id, table);
         Ok(())
     }
 
@@ -1128,6 +1399,204 @@ mod tests {
         db.transaction(|tx| tx.insert(Counter { id: 1, hits: 0 }))
             .unwrap();
         db
+    }
+
+    /// Versions reachable from a slot's chain head, or `None` if the slot is
+    /// empty — which is what tombstone reclamation leaves behind.
+    fn chain_of(db: &Database, key: u64) -> Option<usize> {
+        let guard = crossbeam_epoch::pin();
+        let table = db
+            .table_erased(TypeId::of::<Counter>(), Counter::TABLE_NAME)
+            .unwrap()
+            .downcast_ref::<Table<Counter>>()
+            .unwrap();
+        let slot = table.slot(&key, &guard)?;
+
+        let mut n = 0;
+        let mut cur = slot.latest.load(Ordering::Acquire, &guard);
+        // SAFETY: reachable from `latest` under this pin.
+        while let Some(v) = unsafe { cur.as_ref() } {
+            n += 1;
+            cur = v.prev.load(Ordering::Acquire, &guard);
+        }
+        Some(n)
+    }
+
+    /// Commits needed for the sweep's round-robin to visit every shard at least
+    /// once, with margin. Derived from the real constants so that retuning
+    /// either of them cannot silently make these tests vacuous.
+    const FULL_PASS: u64 = Database::SWEEP_INTERVAL * (crate::engine::slotmap::SHARDS as u64 + 2);
+
+    /// Commits on an unrelated key, to drive the hint refresh and the sweep.
+    fn churn(db: &Database, times: u64) {
+        for i in 0..times {
+            db.transaction(|tx| {
+                tx.insert(Counter {
+                    id: 1_000_000 + i,
+                    hits: 0,
+                })
+            })
+            .unwrap();
+        }
+    }
+
+    #[derive(crate::Mvcc, Clone, Debug)]
+    #[mvcc(table = "indexed")]
+    struct Indexed {
+        #[mvcc(primary_key)]
+        id: u64,
+        #[mvcc(index)]
+        tag: u64,
+    }
+
+    /// Records still held by a table's slot map.
+    fn record_count(db: &Database) -> usize {
+        let guard = crossbeam_epoch::pin();
+        let table = db
+            .table_erased(TypeId::of::<Counter>(), Counter::TABLE_NAME)
+            .unwrap()
+            .downcast_ref::<Table<Counter>>()
+            .unwrap();
+        let mut n = 0;
+        table.slots.for_each(&guard, |_| n += 1);
+        n
+    }
+
+    #[test]
+    fn compaction_frees_deleted_records_and_keeps_live_ones() {
+        let mut db = open();
+        for id in 2..200 {
+            db.transaction(|tx| tx.insert(Counter { id, hits: id }))
+                .unwrap();
+        }
+        // Delete the even keys, keep the odd ones and key 1.
+        for id in (2..200).filter(|id| id % 2 == 0) {
+            db.transaction(|tx| tx.delete::<Counter>(&id)).unwrap();
+        }
+        churn(&db, FULL_PASS);
+
+        let before = record_count(&db);
+        let freed = db.compact();
+        let after = record_count(&db);
+
+        assert!(freed > 0, "nothing was reclaimed");
+        assert_eq!(before - after, freed, "freed count disagrees with the map");
+
+        // Every survivor must still be findable, with the right value, and
+        // every deleted key must still be absent.
+        let mut tx = db.begin();
+        assert_eq!(tx.get::<Counter>(&1).unwrap().unwrap().hits, 0);
+        for id in 2..200 {
+            let got = tx.get::<Counter>(&id).unwrap().map(|c| c.hits);
+            if id % 2 == 0 {
+                assert_eq!(got, None, "deleted key {id} came back");
+            } else {
+                assert_eq!(got, Some(id), "survivor {id} was lost or corrupted");
+            }
+        }
+    }
+
+    #[test]
+    fn a_compacted_key_can_be_inserted_again() {
+        let mut db = open();
+        db.transaction(|tx| tx.delete::<Counter>(&1)).unwrap();
+        churn(&db, FULL_PASS);
+        assert!(db.compact() > 0);
+
+        db.transaction(|tx| tx.insert(Counter { id: 1, hits: 9 }))
+            .unwrap();
+        let mut tx = db.begin();
+        assert_eq!(tx.get::<Counter>(&1).unwrap().unwrap().hits, 9);
+    }
+
+    #[test]
+    fn compaction_drops_index_entries_that_can_no_longer_resolve() {
+        let mut db = Database::open(Config::in_memory()).unwrap();
+        db.register::<Indexed>().unwrap();
+        db.register::<Counter>().unwrap();
+        db.transaction(|tx| tx.insert(Counter { id: 1, hits: 0 }))
+            .unwrap();
+
+        for id in 0..100 {
+            db.transaction(|tx| tx.insert(Indexed { id, tag: id % 5 }))
+                .unwrap();
+        }
+        for id in 0..50 {
+            db.transaction(|tx| tx.delete::<Indexed>(&id)).unwrap();
+        }
+        churn(&db, FULL_PASS);
+        db.compact();
+
+        let table = db
+            .table_erased(TypeId::of::<Indexed>(), Indexed::TABLE_NAME)
+            .unwrap()
+            .downcast_ref::<Table<Indexed>>()
+            .unwrap();
+        let candidates: usize = table.secondary[0].read().values().map(BTreeSet::len).sum();
+        assert_eq!(
+            candidates, 50,
+            "index should hold only the 50 surviving keys"
+        );
+
+        // And the index must still return exactly the survivors.
+        let mut tx = db.begin();
+        let hits = tx.scan_index(Indexed::TAG, 0u64..=4).unwrap();
+        assert_eq!(hits.len(), 50);
+    }
+
+    #[test]
+    fn a_deleted_record_gives_its_versions_back() {
+        let db = open();
+        bump(&db, 64);
+        db.transaction(|tx| tx.delete::<Counter>(&1)).unwrap();
+        assert!(
+            chain_of(&db, 1).unwrap() > 1,
+            "the tombstone and its history should still be here"
+        );
+
+        // Commits elsewhere advance the watermark past the delete and sweep.
+        // A full pass is needed: the sweep visits one shard per round.
+        churn(&db, FULL_PASS);
+
+        assert_eq!(
+            chain_of(&db, 1),
+            Some(0),
+            "a tombstone below the watermark should leave an empty slot"
+        );
+        // And the record must still read as absent, not as resurrected.
+        let mut tx = db.begin();
+        assert!(tx.get::<Counter>(&1).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_emptied_slot_can_be_refilled() {
+        let db = open();
+        db.transaction(|tx| tx.delete::<Counter>(&1)).unwrap();
+        churn(&db, FULL_PASS);
+        assert_eq!(chain_of(&db, 1), Some(0), "precondition: slot was emptied");
+
+        db.transaction(|tx| tx.insert(Counter { id: 1, hits: 7 }))
+            .unwrap();
+        let mut tx = db.begin();
+        assert_eq!(tx.get::<Counter>(&1).unwrap().unwrap().hits, 7);
+    }
+
+    #[test]
+    fn a_record_nobody_writes_any_more_is_still_collected() {
+        let db = open();
+        // Build a chain, then never touch this key again.
+        bump(&db, Database::GC_HINT_INTERVAL * 4);
+        let cold = chain_of(&db, 1).unwrap();
+        assert!(cold > 1, "precondition: key 1 has history to collect");
+
+        // Enough rounds for the round-robin to reach every shard.
+        churn(&db, FULL_PASS);
+
+        let swept = chain_of(&db, 1).unwrap();
+        assert!(
+            swept < cold,
+            "cold chain stayed at {swept} (was {cold}): the sweep never reached it"
+        );
     }
 
     #[test]

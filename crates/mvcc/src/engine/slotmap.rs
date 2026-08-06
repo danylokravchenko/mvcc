@@ -81,7 +81,7 @@ use crate::engine::store::Slot;
 
 /// Independent shards, to keep insert parallelism after the read path stopped
 /// needing shards at all. Reads pick a shard without synchronising.
-const SHARDS: usize = 64;
+pub(crate) const SHARDS: usize = 64;
 
 /// Entries per shard at construction. Grows by doubling.
 const INITIAL_CAPACITY: usize = 16;
@@ -366,6 +366,122 @@ impl<T: Versioned> SlotMap<T> {
         unsafe { guard.defer_destroy(old) };
     }
 
+    /// Free the records whose slots hold no version, and rebuild around what is
+    /// left. Returns how many were reclaimed.
+    ///
+    /// This is the one operation that breaks the append-only rule the whole
+    /// module rests on.
+    ///
+    /// # Safety contract
+    ///
+    /// **The caller must hold `&mut Database`.** That is what makes freeing
+    /// records sound rather than merely careful: a `Transaction<'db>` borrows
+    /// `&'db Database`, so an exclusive borrow of the database is a
+    /// compile-time proof that no transaction exists and therefore that no
+    /// `&Slot<T>` handed out by [`SlotMap::get`] is still outstanding. Nothing
+    /// is deferred and nothing needs to be — there is no reader to race, which
+    /// is why this can free records outright when normal operation cannot.
+    ///
+    /// It takes `&self` only because the map is reached through an `Arc` from
+    /// the registry; `Database::compact` is the sole caller and is where the
+    /// exclusivity is actually proven.
+    ///
+    /// An empty slot means the record was deleted and its tombstone has already
+    /// been collected by [`Slot::prune`](crate::engine::store::Slot::prune) — so
+    /// this reclaims keys that are gone, never ones merely idle.
+    ///
+    /// Both structures are rebuilt rather than patched. The bucket array is open
+    /// addressing with linear probing, where clearing an entry severs the probe
+    /// chains running through it; re-placing the survivors into a fresh array
+    /// avoids that class of bug entirely. The chunk list is rebuilt for the same
+    /// kind of reason — iteration stops at the first null, so it has to stay
+    /// dense.
+    pub(crate) fn compact(&self) -> usize {
+        // SAFETY: the caller holds `&mut Database`, so there is no concurrent
+        // reader and nothing needs deferring — the same shape of argument
+        // `SlotMap::drop` makes from `&mut self`.
+        let guard = unsafe { crossbeam_epoch::unprotected() };
+        let mut reclaimed = 0;
+
+        for shard in &self.shards {
+            let mut count = shard.writers.lock();
+            let mut survivors: Vec<*mut Record<T>> = Vec::with_capacity(*count);
+
+            // Take the whole chunk list; it is rebuilt below from the survivors.
+            let mut chunk = shard.chunks.swap(Shared::null(), Ordering::Relaxed, guard);
+            while !chunk.is_null() {
+                // SAFETY: each chunk is linked into exactly one list and is
+                // reached once here, so this takes ownership exactly once.
+                let owned = unsafe { chunk.into_owned() };
+                for entry in &owned.records {
+                    let record = entry.load(Ordering::Relaxed);
+                    if record.is_null() {
+                        break;
+                    }
+                    // SAFETY: appended by `get_or_create` and not yet freed.
+                    let empty = unsafe { &*record }
+                        .slot
+                        .latest
+                        .load(Ordering::Relaxed, guard)
+                        .is_null();
+                    if empty {
+                        // SAFETY: reached exactly once, and unreachable by
+                        // anyone else — see the contract above.
+                        drop(unsafe { Box::from_raw(record) });
+                        reclaimed += 1;
+                    } else {
+                        survivors.push(record);
+                    }
+                }
+                chunk = owned.next.load(Ordering::Relaxed, guard);
+                drop(owned);
+            }
+
+            // Rebuild the index over exactly the survivors, at a capacity that
+            // keeps `get_or_create`'s "half full at most" probe invariant.
+            let capacity = (survivors.len() * 2)
+                .next_power_of_two()
+                .max(INITIAL_CAPACITY);
+            let buckets = Buckets::with_capacity(capacity);
+            let fresh = Owned::new(Chunk::new()).into_shared(guard);
+            shard.chunks.store(fresh, Ordering::Relaxed);
+
+            for (index, &record) in survivors.iter().enumerate() {
+                // SAFETY: a survivor, so still allocated and owned by this map.
+                let hash = Self::hash(&unsafe { &*record }.key);
+                Self::place(&buckets, hash, record);
+                Self::append(shard, index, record, guard);
+            }
+
+            let old = shard
+                .buckets
+                .swap(Owned::new(buckets), Ordering::Relaxed, guard);
+            // SAFETY: taken out of the map, and no one is probing it — see the
+            // contract above. Dropping `Buckets` frees the array, not records.
+            drop(unsafe { old.into_owned() });
+
+            *count = survivors.len();
+        }
+
+        reclaimed
+    }
+
+    /// Visit the records of one shard, chosen by `round`.
+    ///
+    /// This is what lets a caller walk the whole map a slice at a time. Records
+    /// are spread across [`SHARDS`] shards by hash, so sweeping one shard per
+    /// round touches about `1/SHARDS` of the map and completes a full pass in
+    /// that many rounds — no cursor to store, and no skipping past records that
+    /// were already visited.
+    pub(crate) fn for_each_in_shard<'a>(
+        &'a self,
+        round: usize,
+        guard: &Guard,
+        f: impl FnMut(&'a Record<T>),
+    ) {
+        Self::walk(&self.shards[round % SHARDS], guard, f);
+    }
+
     /// Visit every record in the map, in unspecified order.
     ///
     /// Walks the chunk lists, not the bucket arrays — see [`CHUNK`] for why
@@ -376,24 +492,29 @@ impl<T: Versioned> SlotMap<T> {
     /// when it collected keys shard by shard under a read lock.
     pub(crate) fn for_each<'a>(&'a self, guard: &Guard, mut f: impl FnMut(&'a Record<T>)) {
         for shard in &self.shards {
-            let mut chunk = shard.chunks.load(Ordering::Acquire, guard);
-            'chunks: while !chunk.is_null() {
-                // SAFETY: chunks are linked once and never freed while the map
-                // lives, so any non-null pointer here stays valid.
-                let current = unsafe { chunk.deref() };
-                for entry in &current.records {
-                    let record = entry.load(Ordering::Acquire);
-                    if record.is_null() {
-                        // No holes, and `next` is linked only once a chunk is
-                        // full — so this is the end of the list, not a gap.
-                        break 'chunks;
-                    }
-                    // SAFETY: published with `Release` by `append`, and records
-                    // outlive every epoch.
-                    f(unsafe { &*record });
+            Self::walk(shard, guard, &mut f);
+        }
+    }
+
+    /// Walk one shard's chunk list, oldest record first.
+    fn walk<'a>(shard: &'a Shard<T>, guard: &Guard, mut f: impl FnMut(&'a Record<T>)) {
+        let mut chunk = shard.chunks.load(Ordering::Acquire, guard);
+        'chunks: while !chunk.is_null() {
+            // SAFETY: chunks are linked once and never freed while the map
+            // lives, so any non-null pointer here stays valid.
+            let current = unsafe { chunk.deref() };
+            for entry in &current.records {
+                let record = entry.load(Ordering::Acquire);
+                if record.is_null() {
+                    // No holes, and `next` is linked only once a chunk is
+                    // full — so this is the end of the list, not a gap.
+                    break 'chunks;
                 }
-                chunk = current.next.load(Ordering::Acquire, guard);
+                // SAFETY: published with `Release` by `append`, and records
+                // outlive every epoch.
+                f(unsafe { &*record });
             }
+            chunk = current.next.load(Ordering::Acquire, guard);
         }
     }
 }

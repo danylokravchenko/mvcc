@@ -124,11 +124,13 @@ A delete installs a *tombstone* version rather than removing anything, so a read
 
 ### The failure mode to know about
 
-Superseded versions are reclaimed: when a write commits it also prunes that record's chain, freeing every version no live transaction can still reach. Steady-state memory tracks live data rather than cumulative writes.
+Superseded versions are reclaimed. A write prunes the record's chain as it commits, and a sweep riding on other commits collects records that are no longer written, so steady-state memory tracks live data rather than cumulative writes. Deleting a record eventually returns everything it held, once its tombstone falls below the watermark.
 
 Reclamation is bounded below by the oldest live snapshot. **One forgotten transaction — a REPL session, a leaked handle, a long-running scan — pins that watermark and version chains grow without limit.** It presents as a memory leak rather than as a transaction problem, and it is the most common way real MVCC systems fall over. `db.stats()` exposes the watermark and the live transaction count; watch them.
 
-Two things are deliberately not reclaimed. A record's slot is immortal once created, so inserting and deleting many *distinct* keys still grows. And pruning happens on the write path, so a record that is written once and then only read keeps whatever versions it had at its last write.
+What is *not* reclaimed is the per-key slot: roughly **180 bytes per distinct key** the database has ever held, measured with a counting allocator over 50,000 insert-then-delete keys. That cost is flat in the size of your record — everything that scales with it lives in the version, which is freed — so churning through unboundedly many distinct keys still grows, at a fixed cost per key rather than per byte written.
+
+`db.compact()` reclaims them — measured, 180 bytes per key down to 2. Call it during a quiet moment if your key space is unbounded.
 
 ## Using it
 
@@ -429,9 +431,11 @@ built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is
 
 Not implemented, in rough order of how much they would change things:
 
-- **Slot reclamation.** Version chains are pruned, but the slot itself is never
-  freed, so churning through distinct keys still grows. See
-  [The failure mode to know about](#the-failure-mode-to-know-about).
+- **Online slot reclamation.** `db.compact()` frees the per-key slots of deleted
+  records, but it needs `&mut self` — no transaction may be running. Doing it
+  concurrently would mean either revalidating every write against the map or
+  draining transactions behind a flag, and both put cost on paths that currently
+  have none. See [The failure mode to know about](#the-failure-mode-to-know-about).
 - **Durability.** No log, no recovery. See [Scope](#scope).
 - **Larger-than-memory.** The dataset must fit in RAM.
 - **A distributed anything.** One process, one machine.

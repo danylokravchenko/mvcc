@@ -29,7 +29,9 @@
 //!   pruning needs no synchronisation of its own.
 //! - The write that just lengthened the chain is what pays to shorten it, so
 //!   cost lands on the workload creating the garbage.
-//! - No background thread, and no sweep to find which slots are worth visiting.
+//! - No background thread. A slot being written is exactly a slot worth
+//!   pruning, so the common case needs no search for work at all — see below
+//!   for the sweep that covers the records this misses.
 //!
 //! Dead versions are always a *suffix*. `SlotWrite::commit` stamps a displaced
 //! version's `end` with its successor's `begin`, so `end` decreases walking
@@ -38,10 +40,57 @@
 //! detaches at once. No interior node is ever unlinked, so a reader mid-walk
 //! never has the chain rearranged underneath it.
 //!
-//! What this does **not** reclaim: the `Slot` itself, and the tombstone left by
-//! a delete. Slots are immortal on purpose — it is what lets `SlotMap::get`
-//! hand out a `&Slot<T>` borrowed from the map with no reclamation argument at
-//! all. A workload that inserts and deletes many *distinct* keys still grows.
+//! A **deleted** record is emptied rather than trimmed. Once its tombstone is
+//! itself below the watermark every reader sees the record as absent, so the
+//! whole chain goes and the slot is left holding nothing. That returns the
+//! record's data — the part that scales with `T`.
+//!
+//! What survives is the `Record` — the slot and its key — plus that key's bucket
+//! entry and its slot in the iteration chunk list. Measured with a counting
+//! allocator over 50,000 insert-then-delete keys: **about 180 bytes retained per
+//! distinct key**, of which `Record` is 128 (a `Slot<T>` is one cache line by
+//! `repr(align(64))`, and the key rounds it to two). The figure does not move
+//! with the size of `T`: a record with a 512-byte payload retains the same 180
+//! bytes, because everything that scales with `T` lives in the `Version`, which
+//! *is* freed. In that measurement 39% of live bytes came back on delete.
+//!
+//! Those 180 bytes are reclaimable, but only with exclusive access:
+//! [`Database::compact`](crate::engine::store::Database::compact) takes
+//! `&mut self`, which is a compile-time proof that no transaction exists — a
+//! `Transaction` borrows the database — and so that no slot resolved by one is
+//! still in use. It rebuilds each shard around its survivors, which drops the
+//! retained bytes to about 2 per key. Nothing on the read or write path pays for
+//! its existence.
+//!
+//! Those records are immortal during normal operation, and it is not a detail
+//! that can be changed here — `SlotMap::get` hands out a `&Slot<T>` borrowed from the *map*
+//! rather than from the guard, which is sound only because records outlive every
+//! epoch. Freeing them means changing that borrow, and with it every caller.
+//! So a workload churning through many *distinct* keys still grows, now at a
+//! fixed cost per key ever used rather than per byte ever written.
+//!
+//! # Records nobody writes any more
+//!
+//! Pruning on the write path only ever reaches slots that are written. A record
+//! written once and then only read would keep whatever versions it had at its
+//! last write, so [`Database::sweep`](crate::engine::store::Database::sweep)
+//! walks one shard of every table every `Database::SWEEP_INTERVAL` commits and
+//! prunes what it finds.
+//!
+//! It runs there — on a commit, not on a thread and not on reads — for two
+//! reasons. A background thread is a lifecycle to own and join. And pruning from
+//! reads would put a lock acquisition, which is a *shared write*, back onto the
+//! read path: the one property the whole engine is built around. A database with
+//! no writes sweeps never, and needs nothing swept, because nothing is producing
+//! versions.
+//!
+//! Two details keep it off the write path's critical cost. It checks
+//! `Slot::needs_prune` before locking anything, so a slot with no garbage is
+//! never contended — the slot lock is first-updater-wins, and a sweeper that
+//! grabbed locks speculatively would make user transactions fail with
+//! `WriteConflict`. And it is paced separately from the watermark refresh,
+//! because tying the two together made sweep cost scale with the commit rate and
+//! cost a third of serializable write throughput.
 //!
 //! # The watermark is a hint
 //!

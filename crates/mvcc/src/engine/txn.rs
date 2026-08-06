@@ -1133,7 +1133,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
                 write.commit(ts, gc, &self.guard);
             }
             self.db.oracle().publish(ts);
-            self.db.refresh_gc_hint(ts);
+            self.db.refresh_gc_hint(ts, self.id);
             if let Some(state) = &self.state {
                 state.mark_committed(ts);
             }
