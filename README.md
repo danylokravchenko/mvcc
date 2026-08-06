@@ -122,9 +122,13 @@ A unique index is enforced against the **committed database**, not against your 
 
 A delete installs a *tombstone* version rather than removing anything, so a reader at an older snapshot still finds the record alive.
 
-### The failure mode to know about
+### Memory growth
 
-Old versions can only be reclaimed once no live transaction can still reach them. **One forgotten transaction — a REPL session, a leaked handle, a long-running scan — pins that watermark and version chains grow without limit.** It presents as a memory leak rather than as a transaction problem, and it is the most common way real MVCC systems fall over. `db.stats()` exposes the watermark and the live transaction count; watch them.
+**Superseded versions are never reclaimed.** A version is freed only if the transaction that wrote it aborted; once a write commits, the version it displaced stays in that record's chain for the lifetime of the process. Memory grows with the *total number of writes*, not with the amount of live data — a record updated a million times holds a million versions. Reads do not slow down with it: the newest version is at the head of the chain, so that is what a current-snapshot read finds first.
+
+Budget for it. This suits workloads whose write volume is bounded by something; a long-running writer will need the process recycled.
+
+`db.stats()` reports the GC watermark and the live transaction count. Nothing frees versions based on them today — they are what a reclaimer would be gated on. When one exists the watermark will be a *minimum* over live snapshots, so **one forgotten transaction — a REPL session, a leaked handle, a long-running scan — will pin it and stall reclamation for everyone.** That is the shape this will fail in, and it is the most common way real MVCC systems fall over: it presents as a memory leak rather than as a transaction problem.
 
 ## Using it
 
@@ -418,13 +422,16 @@ Three things worth knowing when reading any number here:
 
 ## Status
 
-Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, epoch-based reclamation, a lock-free primary key map.
+Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, a lock-free primary key map. Epoch-based reclamation is in place for the slot map's superseded bucket arrays and for aborted writes — but not for committed versions; see [Memory growth](#memory-growth).
 
 The examples are the fastest way in, and each one ends by asserting the world it
 built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is the end-to-end tour: two heroes reaching for the same sword (write conflict), a hero overloading herself (write skew, and the fix), a party filling up (a phantom), an atomic trade, a long report reading while the world moves, and a four-thread raid.
 
 Not implemented, in rough order of how much they would change things:
 
+- **Version reclamation.** Committed versions are never freed, so memory tracks
+  cumulative writes rather than live data. The watermark that would gate a
+  reclaimer is already computed and reported. See [Memory growth](#memory-growth).
 - **Durability.** No log, no recovery. See [Scope](#scope).
 - **Larger-than-memory.** The dataset must fit in RAM.
 - **A distributed anything.** One process, one machine.

@@ -2,14 +2,61 @@
 
 use core::fmt;
 
+/// `Result` with this crate's [`Error`] as the default error type.
+///
+/// Every fallible engine operation returns this, so `-> Result<()>` in user
+/// code that has `use mvcc::Result` means the same thing it does here.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
+/// Everything an engine operation can fail with.
+///
+/// The split that matters is [`Error::is_retriable`]: [`WriteConflict`] and
+/// [`SerializationFailure`] are the engine reporting that two transactions
+/// could not both happen, and re-running is the correct response. The rest are
+/// programming mistakes that will fail again identically.
+///
+/// [`Database::transaction`] already loops on the retriable ones, so most code
+/// never matches on this at all.
+///
+/// ```
+/// use mvcc::{Config, Database, Error, Mvcc};
+///
+/// #[derive(Mvcc, Clone)]
+/// struct Account {
+///     #[mvcc(primary_key)] id: u64,
+///     balance: i64,
+/// }
+///
+/// let db = Database::open(Config::in_memory())?;
+/// db.register::<Account>()?;
+/// db.transaction(|tx| tx.insert(Account { id: 1, balance: 0 }))?;
+///
+/// // Inserting the same primary key twice is a programming error, not a race:
+/// // it is not retriable, and `transaction` returns it rather than looping.
+/// let err = db
+///     .transaction(|tx| tx.insert(Account { id: 1, balance: 0 }))
+///     .unwrap_err();
+///
+/// assert!(matches!(err, Error::DuplicateKey { .. }));
+/// assert!(!err.is_retriable());
+/// # Ok::<(), mvcc::Error>(())
+/// ```
+///
+/// `#[non_exhaustive]`: matching must include a `_` arm, so that a new failure
+/// mode is not a breaking change.
+///
+/// [`WriteConflict`]: Error::WriteConflict
+/// [`SerializationFailure`]: Error::SerializationFailure
+/// [`Database::transaction`]: crate::Database::transaction
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// Another transaction committed a conflicting write to the same key after
     /// our snapshot. Retriable: re-run the transaction.
-    WriteConflict { table: &'static str },
+    WriteConflict {
+        /// The table whose record was contended.
+        table: &'static str,
+    },
 
     /// Serializable validation found that something this transaction read has
     /// since changed. Retriable, and expected under contention — this does not
@@ -18,7 +65,9 @@ pub enum Error {
 
     /// A unique index, or the primary key, already holds this value.
     DuplicateKey {
+        /// The table the value would have been written to.
         table: &'static str,
+        /// The index that already holds it, or the primary key.
         index: &'static str,
     },
 
@@ -27,12 +76,18 @@ pub enum Error {
     Aborted,
 
     /// The type was never passed to `Database::register`.
-    TableNotRegistered { table: &'static str },
+    TableNotRegistered {
+        /// The unregistered type's table name.
+        table: &'static str,
+    },
 
     /// An update tried to change the primary key, which would move the record
     /// to a different slot and leave the old one holding a value that no longer
     /// matches its key. Delete and re-insert instead.
-    PrimaryKeyChanged { table: &'static str },
+    PrimaryKeyChanged {
+        /// The table whose primary key the update tried to change.
+        table: &'static str,
+    },
 }
 
 impl Error {

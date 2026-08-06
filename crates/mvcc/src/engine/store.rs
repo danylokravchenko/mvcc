@@ -691,22 +691,16 @@ impl<T: Versioned> Table<T> {
 
 /// Configuration for a [`Database`].
 ///
-/// There is no `data_dir`: this engine is in-memory by design, not by
-/// omission. See `DESIGN.md` §5.
-#[derive(Debug)]
+/// There is no `data_dir`: this engine is in-memory by design, not by omission.
+///
+/// There is no shard count either: the oracle and the slot map each pick their
+/// own, as compile-time constants, because the oracle's is part of how
+/// transaction ids are encoded rather than a tuning knob.
+#[derive(Debug, Default)]
 pub struct Config {
-    /// Number of independent shards. Not yet used — see `DESIGN.md` §6.
-    pub shards: usize,
+    /// Timestamp oracle tuning. The defaults are the measured ones; see
+    /// [`OracleConfig`](crate::config::OracleConfig).
     pub oracle: OracleConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            shards: std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
-            oracle: Default::default(),
-        }
-    }
 }
 
 impl Config {
@@ -735,6 +729,23 @@ pub struct Database {
 }
 
 impl Database {
+    /// Create an empty database.
+    ///
+    /// Nothing is read from disk and nothing will be written to it — see the
+    /// [crate docs](crate#what-this-is-not). Every type it will store must then
+    /// be passed to [`Database::register`] before use.
+    ///
+    /// ```
+    /// use mvcc::{Config, Database};
+    ///
+    /// let db = Database::open(Config::in_memory())?;
+    /// # Ok::<(), mvcc::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` is here so that configuration that
+    /// can fail may be added without a breaking change.
     // Takes `Config` by value even though only `oracle` is read out of it: this
     // is the public constructor, and handing ownership over is what lets fields
     // be added later without changing the signature.
@@ -748,7 +759,13 @@ impl Database {
         })
     }
 
-    pub fn oracle(&self) -> &Oracle {
+    /// The timestamp oracle.
+    ///
+    /// `pub(crate)`: `Oracle` is not re-exported, so a `pub` accessor here
+    /// promised users a type they could neither name nor read the docs for.
+    /// [`OracleConfig`](crate::config::OracleConfig) is the supported way to
+    /// influence it, and [`Database::stats`] the supported way to observe it.
+    pub(crate) fn oracle(&self) -> &Oracle {
         &self.oracle
     }
 
@@ -759,8 +776,6 @@ impl Database {
     /// Snapshot of engine statistics. See [`crate::stats`] for what to watch.
     pub fn stats(&self) -> crate::engine::gc::GcStats {
         crate::engine::gc::GcStats {
-            pending_reclaim: 0,
-            reclaimed_total: 0,
             watermark: self.oracle.gc_watermark(),
             active_transactions: self.oracle.active_count(),
         }
@@ -792,7 +807,7 @@ impl Database {
     /// result without naming `T`. Returning a reference rather than an `Arc`
     /// matters more than it looks: this is on *every* operation, and cloning the
     /// `Arc` meant an atomic increment and decrement on one refcount shared by
-    /// every core in the process. See `DESIGN.md` §6.
+    /// every core in the process.
     pub(crate) fn table_erased(
         &self,
         type_id: TypeId,
@@ -825,9 +840,26 @@ impl Database {
 
     /// Begin a transaction at a chosen isolation level.
     ///
-    /// ```ignore
-    /// let tx = db.begin_with::<Serializable>();
+    /// The level is a type parameter, so the cost of the strongest never leaks
+    /// into the weakest — see [`IsolationLevel`].
+    ///
     /// ```
+    /// # use mvcc::{Config, Database, Mvcc, ReadCommitted, Serializable};
+    /// # #[derive(Mvcc, Clone)]
+    /// # struct Account {
+    /// #     #[mvcc(primary_key)] id: u64,
+    /// #     balance: i64,
+    /// # }
+    /// # let db = Database::open(Config::in_memory())?;
+    /// # db.register::<Account>()?;
+    /// let strict = db.begin_with::<Serializable>();
+    /// let cheap = db.begin_with::<ReadCommitted>();
+    /// # Ok::<(), mvcc::Error>(())
+    /// ```
+    ///
+    /// Prefer [`Database::transaction_with`] unless you need manual control:
+    /// this hands back a transaction you must commit yourself, and **dropping
+    /// it without committing rolls it back**.
     pub fn begin_with<I: IsolationLevel>(&self) -> Transaction<'_, I> {
         Transaction::new(self)
     }
@@ -855,9 +887,44 @@ impl Database {
     /// Run `f` in a transaction at isolation level `I`, retrying while it fails
     /// retriably, and commit.
     ///
-    /// ```text
-    /// db.transaction_with::<Serializable, _, _>(|tx| { … })?;
+    /// Reach for [`Serializable`](crate::Serializable) here when a transaction's
+    /// *write* depends on a value it merely *read* — a balance check, a capacity
+    /// limit. That is the write-skew shape, and snapshot isolation does not
+    /// catch it.
+    ///
     /// ```
+    /// # use mvcc::{Config, Database, Mvcc, Serializable};
+    /// # #[derive(Mvcc, Clone)]
+    /// # struct Account {
+    /// #     #[mvcc(primary_key)] id: u64,
+    /// #     balance: i64,
+    /// # }
+    /// # let db = Database::open(Config::in_memory())?;
+    /// # db.register::<Account>()?;
+    /// # db.transaction(|tx| {
+    /// #     tx.insert(Account { id: 1, balance: 100 })?;
+    /// #     tx.insert(Account { id: 2, balance: 0 })
+    /// # })?;
+    /// // Withdraw only if the balance covers it. The check and the write must
+    /// // be serializable together, or two concurrent transfers each see a
+    /// // sufficient balance and both withdraw.
+    /// let moved = db.transaction_with::<Serializable, _, _>(|tx| {
+    ///     let balance = tx.get::<Account>(&1)?.map_or(0, |a| a.balance);
+    ///     if balance < 50 {
+    ///         return Ok(false);
+    ///     }
+    ///     tx.update::<Account>(&1, |a| a.balance -= 50)?;
+    ///     tx.update::<Account>(&2, |a| a.balance += 50)?;
+    ///     Ok(true)
+    /// })?;
+    ///
+    /// assert!(moved);
+    /// # Ok::<(), mvcc::Error>(())
+    /// ```
+    ///
+    /// As with [`Database::transaction`], `f` may run more than once, so it
+    /// must not have side effects outside the transaction. Return the value and
+    /// let the caller act on the committed result, as above.
     pub fn transaction_with<I, R, F>(&self, mut f: F) -> Result<R>
     where
         I: IsolationLevel,

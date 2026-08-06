@@ -23,6 +23,7 @@ pub struct TableId(pub u16);
 pub struct IndexKey(pub Vec<u8>);
 
 impl IndexKey {
+    /// The encoded bytes, whose `memcmp` order is the key's logical order.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -101,8 +102,18 @@ impl<T> Copy for IndexDesc<T> {}
 /// Implemented by the crate for primitives and `String`; the derive calls it to
 /// build [`IndexKey`]s.
 pub trait Encodable {
+    /// Append this value's order-preserving encoding to `out`.
+    ///
+    /// Appending rather than returning is what lets a composite key concatenate
+    /// its parts into one buffer without an allocation per component.
+    ///
+    /// Implementations must be order-preserving: for any `a` and `b`, the
+    /// `memcmp` order of their encodings must match their logical order.
+    /// A range scan is a byte-range walk over the index, so an encoding that
+    /// breaks this silently returns wrong rows rather than failing.
     fn encode_to(&self, out: &mut Vec<u8>);
 
+    /// This value encoded as a standalone [`IndexKey`].
     fn encode(&self) -> IndexKey {
         let mut out = Vec::new();
         self.encode_to(&mut out);

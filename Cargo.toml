@@ -30,6 +30,13 @@ debug = true
 # plus the structural ones this codebase already satisfies.
 [workspace.lints.rust]
 unreachable_pub = "warn"
+# The public surface is small and is the crate's actual interface, so an
+# undocumented item in it is a gap rather than a style nit. CI runs clippy with
+# `-D warnings`, which makes this a build failure there while leaving a local
+# `cargo check` merely noisy. Private items are deliberately not covered: the
+# internals are documented heavily, but by prose that explains a decision rather
+# than by one line per field.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 # Complexity budgets; thresholds in clippy.toml.

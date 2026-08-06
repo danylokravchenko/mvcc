@@ -30,6 +30,11 @@ impl Timestamp {
     /// After every possible commit. Used as `end` for the current version.
     pub const MAX: Timestamp = Timestamp(ID_MASK);
 
+    /// The underlying counter value.
+    ///
+    /// Useful for logging and for comparing two timestamps' distance. The
+    /// number itself carries no meaning beyond its order: it counts commits,
+    /// not time, so it advances only when transactions do.
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0

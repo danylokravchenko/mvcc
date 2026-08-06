@@ -1,69 +1,217 @@
-//! Multi-version concurrency control for ordinary Rust structs.
+//! Transactions, isolation levels, and enforced constraints for ordinary Rust
+//! structs.
 //!
-//! Add `#[derive(Mvcc)]` to a struct and it becomes a transactional, versioned,
-//! in-memory table. Readers never block writers and writers never block readers.
-//! Nothing is written to disk — see [What this is not](#what-this-is-not).
+//! This is a database's **concurrency control** without a database's **storage
+//! layer**: atomicity, consistency, and isolation, but no durability. Nothing is
+//! ever written to disk. That is a deliberate trade — see
+//! [What this is not](#what-this-is-not).
 //!
+//! Add [`derive@Mvcc`] to a struct, register it with a [`Database`], and several
+//! threads can read and write it through [`Transaction`]s that each see a
+//! consistent snapshot of the whole database.
+//!
+//! # The problem it solves
+//!
+//! The honest comparison is not against Postgres, it is against
+//! `RwLock<HashMap<K, V>>`.
+//!
+//! A lock gives you one map at a time. The moment an invariant spans *two* maps
+//! — or two records in one map — you need a consistent view across both, and the
+//! only way to get one from a lock is to hold it globally, which serialises
+//! every reader against every writer. Long reads make it worse: an analytics
+//! scan holding a read lock blocks writers for its whole duration.
+//!
+//! Multi-version concurrency control removes that trade. Reach for this crate
+//! when you have **shared mutable state that several threads read and write, and
+//! invariants that span more than one record**. If you have one map and no
+//! cross-record invariant, the lock is simpler and you should use it.
+//!
+//! | you need | use |
+//! | --- | --- |
+//! | data to survive a restart | an embedded database — `redb`, `sled`, `SQLite` |
+//! | more data than fits in RAM | anything with a buffer pool |
+//! | multiple processes | a real database server |
+//! | one map, one thread at a time | `RwLock<HashMap<K, V>>` — genuinely |
+//! | queries by shape rather than by key | a query engine; this has no planner |
+//!
+//! # How it works
+//!
+//! The core idea: **never overwrite data, and never block a reader.** An update
+//! writes a *new version* and leaves the old one in place. Each record is a slot
+//! holding a chain of versions, newest first:
+//!
+//! ```text
+//! index ──► Slot ──► Version { begin: 40, end: MAX, value }   ← current
+//!                         │
+//!                         ▼
+//!                    Version { begin: 20, end: 40,  value }
+//!                         │
+//!                         ▼
+//!                    Version { begin:  5, end: 20,  value }
 //! ```
+//!
+//! A version is visible to a snapshot `s` when `begin <= s < end`. That is the
+//! whole visibility rule, and it is why the [isolation levels](#isolation-levels)
+//! differ only in *which snapshot they pass in*.
+//!
+//! A transaction takes a snapshot timestamp when it begins and reads at it for
+//! its whole life, so its view never changes underneath it, no matter what
+//! commits alongside. Reading is a pointer walk and a comparison — no locks, no
+//! reference counts, and no writes to shared memory at all, which is why
+//! contended reads scale rather than collapse.
+//!
+//! Writing is **first-updater-wins**: a writer claims the slot, and a second
+//! writer fails immediately with [`Error::WriteConflict`] rather than waiting.
+//! Waiting would reintroduce deadlock detection, which is one of the things MVCC
+//! removes. A delete installs a *tombstone* version rather than removing
+//! anything, so a reader at an older snapshot still finds the record alive.
+//!
+//! # Getting started
+//!
+//! Declare the record, register it, and do the work inside a transaction:
+//!
+//! ```rust
 //! use mvcc::{Config, Database, Mvcc, Serializable};
 //!
 //! #[derive(Mvcc, Clone, Debug)]
 //! #[mvcc(table = "accounts")]
 //! struct Account {
-//!     #[mvcc(primary_key)] id: u64,
-//!     #[mvcc(index)] owner: String,
+//!     #[mvcc(primary_key)]
+//!     id: u64,
+//!
+//!     /// No two accounts may share an owner; the engine enforces it.
+//!     #[mvcc(index(unique))]
+//!     owner: String,
+//!
 //!     balance: i64,
 //! }
 //!
 //! let db = Database::open(Config::in_memory())?;
 //! db.register::<Account>()?;
 //!
-//! // Snapshot isolation by default; retries on conflict.
 //! db.transaction(|tx| {
 //!     tx.insert(Account { id: 1, owner: "ada".into(), balance: 100 })?;
-//!     tx.insert(Account { id: 2, owner: "bob".into(), balance: 0 })?;
-//!     Ok(())
+//!     tx.insert(Account { id: 2, owner: "bob".into(), balance: 0 })
 //! })?;
 //!
-//! // A transfer needs the stronger level: under snapshot isolation two
-//! // concurrent transfers can each read a balance the other is about to
-//! // change (write skew).
-//! db.transaction_with::<Serializable, _, _>(|tx| {
+//! // This transfer's *write* depends on a balance it *read*, so it needs the
+//! // strongest level — see below.
+//! let moved = db.transaction_with::<Serializable, _, _>(|tx| {
+//!     let balance = tx.get::<Account>(&1)?.map_or(0, |a| a.balance);
+//!     if balance < 50 {
+//!         return Ok(false);
+//!     }
 //!     tx.update::<Account>(&1, |a| a.balance -= 50)?;
 //!     tx.update::<Account>(&2, |a| a.balance += 50)?;
-//!     Ok(())
+//!     Ok(true)
 //! })?;
+//!
+//! assert!(moved);
+//!
+//! let mut tx = db.begin();
+//! assert_eq!(tx.get::<Account>(&2)?.unwrap().balance, 50);
 //! # Ok::<(), mvcc::Error>(())
 //! ```
 //!
-//! # Choosing an isolation level
+//! [`Database::transaction`] is the API to reach for: it runs the closure,
+//! commits it, and **re-runs it on a retriable conflict**. Because it may run
+//! more than once, the closure must not have side effects outside the
+//! transaction — return the value and let the caller act on the committed
+//! result, as above. For manual control, [`Database::begin`] hands back a
+//! transaction you commit yourself, and **dropping it without committing rolls
+//! it back**.
 //!
-//! [`Snapshot`] is the default and the right answer for most workloads. Reach
-//! for [`Serializable`] when a transaction's *write* depends on a value it
-//! merely *read* — balance checks, capacity limits, uniqueness enforced in
-//! application code. That is the write-skew shape, and snapshot isolation will
-//! not catch it. Expect retriable aborts in exchange.
+//! # Isolation levels
 //!
-//! # What this gives you
+//! The level is a **type parameter, not a runtime flag**, so the cost of the
+//! strongest never leaks into the weakest: a [`ReadCommitted`] transaction
+//! records no read set and allocates nothing.
 //!
-//! - Snapshot isolation and serializability behave as documented per level; the
-//!   anomaly suite in `tests/isolation_anomalies.rs` pins this down.
-//! - Readers never block on writers, and never abort. Following a version chain
-//!   takes no locks and writes nothing to shared memory.
-//! - A transaction dropped without `commit()` rolls back.
-//! - Fields may be of any type: nothing is serialised, so a record can hold a
-//!   `HashMap`, an `Instant`, a function pointer — whatever your struct holds.
+//! | level | sees | permits |
+//! | --- | --- | --- |
+//! | [`ReadCommitted`] | a fresh snapshot per statement | non-repeatable reads, phantoms |
+//! | [`RepeatableRead`] | one snapshot | write skew |
+//! | [`Snapshot`] *(default)* | one snapshot | write skew |
+//! | [`Serializable`] | one snapshot + conflict detection | nothing |
+//!
+//! **Default to [`Snapshot`].** Reads never block and never abort, and lost
+//! updates are impossible.
+//!
+//! **Reach for [`Serializable`] when a transaction's *write* depends on
+//! something it merely *read*** — balance checks, capacity limits, "at least one
+//! of these must remain true". That is the write-skew shape, and snapshot
+//! isolation will not catch it: two transfers can each read a sufficient balance
+//! and both withdraw, because on the write side they touch different rows and so
+//! nothing conflicts. Expect retriable aborts in exchange.
+//!
+//! Isolation behaviour is verified against [Hermitage], Martin Kleppmann's
+//! isolation test suite: all ten anomalies, each asserted *present or absent per
+//! level*, because a level that forbids too much is as wrong as one that forbids
+//! too little.
+//!
+//! # Conflicts are normal
+//!
+//! Under MVCC a conflict is not an error condition — it is how the engine
+//! reports that two transactions could not both happen. [`Error::is_retriable`]
+//! draws the line that matters: [`WriteConflict`] and [`SerializationFailure`]
+//! mean re-run, and everything else is a programming mistake that will fail
+//! again identically. [`Database::transaction`] already loops on the retriable
+//! ones, so most code never matches on this at all.
+//!
+//! When scanning, prefer [`Transaction::scan_where`] over
+//! [`scan`][Transaction::scan] plus `.filter()`. The first hands the predicate to
+//! the engine, which re-evaluates it at commit and so can detect a row that
+//! *appears* and matches — a phantom. The second says only that you read the
+//! entire table, so any concurrent write to it aborts you.
+//!
+//! # Memory growth
+//!
+//! **Superseded versions are never reclaimed.** A version is freed only if the
+//! transaction that wrote it aborted; once a write commits, the version it
+//! displaced stays in that record's chain for the lifetime of the process.
+//! Memory therefore grows with the *total number of writes*, not with the amount
+//! of live data — a record updated a million times holds a million versions.
+//!
+//! Budget for it accordingly: this suits workloads whose write volume is bounded
+//! by something, and a long-running writer will need the process recycled.
+//! Read performance does not degrade with chain length, because the newest
+//! version sits at the head of the chain and that is what a current-snapshot
+//! read finds first.
+//!
+//! [`Database::stats`] reports the GC watermark and the live transaction count.
+//! Nothing frees versions based on them today — they are what a reclaimer would
+//! be gated on. When one exists the watermark will be a *minimum* over live
+//! snapshots, so a single forgotten transaction — a REPL session, a leaked
+//! handle, a long-running scan — will pin it and stall reclamation for
+//! everyone. That is the shape this will fail in, and it is the most common way
+//! real MVCC systems fall over: it presents as a memory leak rather than as a
+//! transaction problem. Watching those two numbers now costs nothing and is the
+//! signal then.
 //!
 //! # What this is not
 //!
 //! **It is not durable, by design.** Everything lives in memory and nothing
-//! survives the process. There is no log, no checkpoint, no `data_dir`. Think
-//! of it as a transactional, concurrent, versioned in-memory store — the
-//! semantics of a database's concurrency control without a database's storage
-//! layer. `DESIGN.md` §5 records what adding durability would take and why it
-//! was left out.
+//! survives the process — no log, no checkpoint, no `data_dir`, no recovery.
 //!
-//! It is also not distributed, and the dataset must fit in memory.
+//! It is also not distributed — one process, one machine — and the dataset must
+//! fit in memory. There is no query planner: records are reached by primary key,
+//! by predicate, or by a range over a declared index.
+//!
+//! # Where to look next
+//!
+//! - [`derive@Mvcc`] — declaring a record, and the full attribute reference.
+//! - [`Transaction`] — reading, writing, and scanning.
+//! - [`Database`] — opening, registering types, running transactions.
+//! - [`Error`] — what can fail, and which failures are worth retrying.
+//! - The `examples/` directory in the repository is the fastest way in. Each
+//!   example ends by asserting that the world it built is still consistent;
+//!   `game.rs` is the end-to-end tour, covering a write conflict, write skew and
+//!   its fix, a phantom, an atomic trade, a long report reading while the world
+//!   moves, and a four-thread raid.
+//!
+//! [Hermitage]: https://github.com/ept/hermitage
+//! [`WriteConflict`]: Error::WriteConflict
+//! [`SerializationFailure`]: Error::SerializationFailure
 
 #![doc(html_no_source)]
 
@@ -80,6 +228,109 @@ pub use crate::engine::store::Config;
 pub use crate::engine::txn::Ref;
 pub use crate::engine::{Database, Transaction};
 
+/// Make a struct storable in a `Database`, by implementing `Versioned` for it.
+///
+/// Exactly one field must be marked `#[mvcc(primary_key)]`. Any others may be
+/// indexed. The struct must also be `Clone`, because an update copies the record
+/// before mutating it into a new version.
+///
+/// ```rust
+/// use mvcc::{Config, Database, Mvcc};
+///
+/// #[derive(Mvcc, Clone, Debug)]
+/// #[mvcc(table = "accounts")]
+/// pub struct Account {
+///     #[mvcc(primary_key)]
+///     pub id: u64,
+///
+///     /// No two accounts may share an owner.
+///     #[mvcc(index(unique))]
+///     pub owner: String,
+///
+///     /// Range-scannable, duplicates allowed.
+///     #[mvcc(index)]
+///     pub branch: u32,
+///
+///     pub balance: i64,
+/// }
+///
+/// let db = Database::open(Config::in_memory())?;
+/// db.register::<Account>()?;
+///
+/// db.transaction(|tx| {
+///     tx.insert(Account { id: 1, owner: "ada".into(), branch: 10, balance: 500 })
+/// })?;
+///
+/// // The derive emits `Account::BRANCH` for the indexed field, and that const —
+/// // not a string — is what a scan takes.
+/// let mut tx = db.begin();
+/// let at_branch_10 = tx.scan_index(Account::BRANCH, 10u32..=10)?;
+/// assert_eq!(at_branch_10.len(), 1);
+/// # Ok::<(), mvcc::Error>(())
+/// ```
+///
+/// # Attribute reference
+///
+/// | attribute | position | meaning |
+/// |---|---|---|
+/// | `table = "name"` | struct | table name, used only in error messages; defaults to the type name |
+/// | `primary_key` | field | required, exactly one |
+/// | `index` | field | secondary index on this field |
+/// | `index(unique)` | field | unique secondary index |
+///
+/// An index is always named after its field. There is no rename knob: the name
+/// is not a string anyone types, it is the associated const above, so renaming
+/// it would only decouple the const from the field it reads.
+///
+/// There is no `skip`: nothing is serialised, so every field is simply carried
+/// along in the struct. Fields need no traits beyond what `Versioned` requires
+/// of the struct as a whole — a record can hold a `HashMap`, an `Instant`, or a
+/// function pointer.
+///
+/// # What it expands to
+///
+/// - `impl Versioned for Account` — key type and extraction, `memcmp` key
+///   encoding, and the index descriptor table.
+/// - a private `static` holding the index descriptors, const-constructed with
+///   `extract` as a plain `fn` pointer.
+/// - a private `static OnceLock<TableId>`, filled by `Database::register`.
+/// - `Account::OWNER: Index<Account, String>` — one associated const per
+///   indexed field, named after the field in upper case, which is how scans
+///   name an index. Carrying the field's type is the point: it is what makes
+///   `tx.scan_index(Account::OWNER, 1u64..=2)` a type error rather than a scan
+///   that matches nothing.
+///
+/// Everything is emitted inside a `const _: () = { … };` block so the generated
+/// statics cannot collide with user items or with a second derive in the same
+/// module.
+///
+/// # What it deliberately does not do
+///
+/// It does not make the struct itself transactional. `Account` gains no interior
+/// mutability, no `Drop`, and no hidden fields — it stays a plain Rust struct
+/// you can construct, match on, and pass around. All transactional behaviour
+/// lives on `Transaction`, which is where errors can actually be returned.
+///
+/// # Compile errors
+///
+/// Missing a primary key is rejected at expansion time rather than producing a
+/// type that fails obscurely later:
+///
+/// ```compile_fail
+/// # use mvcc::Mvcc;
+/// #[derive(Mvcc, Clone)]
+/// struct NoKey {
+///     name: String,
+/// }
+/// ```
+///
+/// So is declaring two of them, and so is applying the derive to an enum,
+/// a union, or a tuple struct.
+///
+/// The macro itself lives in the `mvcc-derive` crate. It is documented here, on
+/// the re-export, because a compiling example needs the [`Versioned`] trait it
+/// implements — which lives in this crate, so documenting it from the other
+/// direction would mean a dependency cycle.
 #[cfg(feature = "derive")]
 pub use mvcc_derive::Mvcc;
 

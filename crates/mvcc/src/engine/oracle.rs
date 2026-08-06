@@ -143,8 +143,7 @@ struct ActiveShard {
 
 /// Hands out transaction ids and commit timestamps, and maintains the two
 /// watermarks.
-pub struct Oracle {
-    config: OracleConfig,
+pub(crate) struct Oracle {
     /// Commit timestamps. Gap-free, because the completion ring depends on it.
     next_ts: AtomicU64,
     /// Transaction ids, one counter per shard.
@@ -163,9 +162,12 @@ pub struct Oracle {
 }
 
 impl Oracle {
-    pub fn new(config: OracleConfig) -> Self {
+    /// Takes the strategy even though [`OracleConfig`] has exactly one variant,
+    /// for the reasons its own docs give: there is nothing to select between
+    /// yet, and keeping the parameter means adding a second strategy is a
+    /// change inside this file rather than to `Database::open`'s signature.
+    pub(crate) fn new(_config: OracleConfig) -> Self {
         Oracle {
-            config,
             // Start at 1: timestamp 0 means "before everything", and is the
             // watermark's initial value.
             next_ts: AtomicU64::new(1),
@@ -184,23 +186,13 @@ impl Oracle {
         }
     }
 
-    pub fn config(&self) -> OracleConfig {
-        self.config
-    }
-
-    /// Restart the counters above `ts`.
-    pub fn resume_after(&self, ts: Timestamp) {
-        self.next_ts.store(ts.raw() + 1, Ordering::Release);
-        self.read_watermark.store(ts.raw(), Ordering::Release);
-    }
-
     /// Allocate a transaction id.
     ///
     /// Ids and commit timestamps come from different counters and may coincide
     /// numerically. That is safe: a version's `begin` field is tagged (see
     /// `crate::core::time`), and the tag — not the value — says whether it holds
     /// an in-flight writer or a commit timestamp.
-    pub fn next_txn_id(&self) -> TxnId {
+    pub(crate) fn next_txn_id(&self) -> TxnId {
         let slot = thread_slot();
         let n = self.next_id[slot].next.fetch_add(1, Ordering::Relaxed);
         // `1 +` because 0 is `TxnId::NONE`, and because `Slot::lock` uses 0 to
@@ -213,7 +205,7 @@ impl Oracle {
     ///
     /// Returns the *read watermark*, not the raw counter, so a transaction
     /// cannot see a commit whose versions are still being stamped.
-    pub fn begin_snapshot(&self, id: TxnId) -> Timestamp {
+    pub(crate) fn begin_snapshot(&self, id: TxnId) -> Timestamp {
         // Bring the watermark current, since this is the point at which its
         // staleness would become observable. One load and a comparison when
         // there is nothing to do; the compare-exchange runs only when it can
@@ -228,12 +220,12 @@ impl Oracle {
     /// A snapshot for a statement in a `ReadCommitted` transaction, and for
     /// commit-time revalidation. Registers nothing: the caller's begin snapshot
     /// already pins the watermark.
-    pub fn statement_snapshot(&self) -> Timestamp {
+    pub(crate) fn statement_snapshot(&self) -> Timestamp {
         Timestamp(self.read_watermark.load(Ordering::Acquire))
     }
 
     /// Drop a transaction's registration when it commits or aborts.
-    pub fn release_snapshot(&self, id: TxnId, ts: Timestamp) {
+    pub(crate) fn release_snapshot(&self, id: TxnId, ts: Timestamp) {
         let mut shard = self.shard(id).snapshots.lock();
         // Removes one entry, not every equal one — several live transactions
         // may share this snapshot value.
@@ -246,7 +238,7 @@ impl Oracle {
     ///
     /// Must be paired with [`Oracle::publish`], or the read watermark stops at
     /// this timestamp and every later snapshot freezes.
-    pub fn begin_commit(&self) -> Timestamp {
+    pub(crate) fn begin_commit(&self) -> Timestamp {
         let ts = self.next_ts.fetch_add(1, Ordering::Relaxed);
 
         // The ring describes `RING` timestamps at once, so running further
@@ -282,7 +274,7 @@ impl Oracle {
     /// Removing the loop entirely, as a throwaway experiment, took four-thread
     /// write throughput from 5.45M to 8.98M ops/sec — so one load and a
     /// comparison to skip it is worth having.
-    pub fn publish(&self, ts: Timestamp) {
+    pub(crate) fn publish(&self, ts: Timestamp) {
         self.completed[(ts.raw() & RING_MASK) as usize].store(ts.raw(), Ordering::Release);
 
         if self.read_watermark.load(Ordering::Acquire) + 1 == ts.raw() {
@@ -320,7 +312,7 @@ impl Oracle {
     ///
     /// A single long-running reader pins this and stalls all reclamation — the
     /// classic MVCC failure mode. See [`crate::engine::gc`].
-    pub fn gc_watermark(&self) -> Timestamp {
+    pub(crate) fn gc_watermark(&self) -> Timestamp {
         let oldest = self
             .active
             .iter()
@@ -333,7 +325,7 @@ impl Oracle {
     }
 
     /// Number of live transactions, for [`crate::engine::gc::GcStats`].
-    pub fn active_count(&self) -> usize {
+    pub(crate) fn active_count(&self) -> usize {
         self.active.iter().map(|s| s.snapshots.lock().len()).sum()
     }
 

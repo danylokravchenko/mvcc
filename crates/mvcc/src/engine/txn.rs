@@ -389,6 +389,8 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         }
     }
 
+    /// This transaction's id, drawn from the same counter as commit
+    /// timestamps. Stable for its whole life, and never reused.
     pub fn id(&self) -> TxnId {
         self.id
     }
@@ -784,19 +786,41 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// afterwards, and that is the entire point under `Serializable`: the
     /// engine records it, re-evaluates it at commit, and aborts if the set of
     /// matching rows changed. That is what makes phantoms visible — see
-    /// `PredicateRead` — and it is why
+    /// `PredicateRead` — and it is why the first form below is a materially
+    /// stronger statement than the second, even though both return the same
+    /// rows:
     ///
-    /// ```ignore
-    /// tx.scan_where::<Account, _>(|a| a.balance < 0)?
+    /// ```rust
+    /// # use mvcc::{Config, Database, Mvcc, Serializable};
+    /// # #[derive(Mvcc, Clone)]
+    /// # struct Account {
+    /// #     #[mvcc(primary_key)] id: u64,
+    /// #     balance: i64,
+    /// # }
+    /// # let db = Database::open(Config::in_memory())?;
+    /// # db.register::<Account>()?;
+    /// # db.transaction(|tx| {
+    /// #     tx.insert(Account { id: 1, balance: -5 })?;
+    /// #     tx.insert(Account { id: 2, balance: 10 })
+    /// # })?;
+    /// db.transaction_with::<Serializable, _, _>(|tx| {
+    ///     // The engine holds the predicate and re-runs it at commit, so an
+    ///     // overdrawn account appearing concurrently aborts this transaction.
+    ///     let overdrawn = tx.scan_where::<Account, _>(|a| a.balance < 0)?;
+    ///     assert_eq!(overdrawn.len(), 1);
+    ///
+    ///     // Same rows, weaker claim: this says only "I read the whole table",
+    ///     // so *any* concurrent write to it aborts, and no phantom is named.
+    ///     let same: Vec<_> = tx
+    ///         .scan::<Account>()?
+    ///         .into_iter()
+    ///         .filter(|a| a.balance < 0)
+    ///         .collect();
+    ///     assert_eq!(same.len(), 1);
+    ///     Ok(())
+    /// })?;
+    /// # Ok::<(), mvcc::Error>(())
     /// ```
-    ///
-    /// is a materially stronger statement than
-    ///
-    /// ```ignore
-    /// tx.scan::<Account>()?.into_iter().filter(|a| a.balance < 0)
-    /// ```
-    ///
-    /// The second form tells the engine only that you read the whole table.
     ///
     /// `predicate` must be `Send + Sync + 'static` because it is retained for
     /// the transaction's lifetime and re-run at commit. It should be pure:
@@ -851,7 +875,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     /// not compile, and neither does a range of the wrong type. Both used to be
     /// runtime outcomes: a bad name an error, a mistyped range an empty result.
     ///
-    /// ```
+    /// ```rust
     /// use mvcc::{Config, Database, Mvcc};
     ///
     /// #[derive(Mvcc, Clone)]

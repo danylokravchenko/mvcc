@@ -1,59 +1,50 @@
-//! `#[derive(Mvcc)]`.
+//! The proc-macro behind `#[derive(Mvcc)]`, which turns a plain struct into a
+//! table the `mvcc` engine can store.
 //!
-//! # What the user writes
+//! **Do not depend on this crate directly.** Depend on `mvcc`, which re-exports
+//! the derive and is the only thing the generated code refers to. The
+//! user-facing documentation — what the attributes mean, what you get — lives on
+//! that re-export, so that it renders at `mvcc::Mvcc` where people arrive, and
+//! so that its examples are real doctests. They could not live here: a compiling
+//! example needs the `Versioned` trait this macro implements, and depending on
+//! `mvcc` to get it, even as a dev-dependency, is a cycle. This page is for
+//! reading or changing the expansion.
 //!
-//! ```ignore
-//! #[derive(Mvcc, Clone, Debug)]
-//! #[mvcc(table = "accounts")]
-//! pub struct Account {
-//!     #[mvcc(primary_key)]
-//!     pub id: u64,
-//!     #[mvcc(index)]
-//!     pub owner: String,
-//!     pub balance: i64,
+//! # What it generates
+//!
+//! Given a struct with a primary key and one indexed field:
+//!
+//! ```text
+//! #[derive(Mvcc, Clone)]
+//! struct Account {
+//!     #[mvcc(primary_key)] id: u64,
+//!     #[mvcc(index)]       owner: String,
+//!     balance: i64,
 //! }
 //! ```
 //!
-//! # What it expands to
+//! the expansion is, in outline:
 //!
-//! - `impl Versioned for Account` — key type and extraction, `memcmp` key
-//!   encoding, and the index descriptor table.
-//! - a private `static` holding the index descriptors, const-constructed with
-//!   `extract` as a plain `fn` pointer.
-//! - a private `static OnceLock<TableId>`, filled by `Database::register`.
-//! - `Account::OWNER: Index<Account, String>` — one associated const per
-//!   indexed field, named after the field in upper case, which is how scans
-//!   name an index. Carrying the field's type is the point: it is what makes
-//!   `tx.scan_index(Account::OWNER, 1u64..=2)` a type error rather than a scan
-//!   that matches nothing.
+//! ```text
+//! const _: () = {
+//!     use ::mvcc::__private as _mvcc;
 //!
-//! Everything is emitted inside a `const _: () = { … };` block so the generated
-//! statics cannot collide with user items or with a second derive in the same
-//! module.
+//!     // Filled in by `Database::register`; ids are assigned in registration
+//!     // order, so this cannot be a `const`.
+//!     static __MVCC_TABLE_ID: OnceLock<TableId> = OnceLock::new();
 //!
-//! # What it deliberately does not do
+//!     // Index descriptors, const-constructed. `extract` is a plain `fn`
+//!     // pointer, so the table needs no allocation and no lazy init.
+//!     static __MVCC_INDEXES: [IndexDesc<Account>; 1] = [ … ];
 //!
-//! It does not make the struct itself transactional. `Account` gains no interior
-//! mutability, no `Drop`, and no hidden fields — it stays a plain Rust struct
-//! you can construct, match on, and pass around. All transactional behaviour
-//! lives on `Transaction`, which is where errors can actually be returned.
+//!     impl Account {
+//!         pub const OWNER: Index<Account, String> = Index::new(0, "owner");
+//!     }
 //!
-//! # Attribute reference
+//!     impl Versioned for Account { type Key = u64; … }
+//! };
+//! ```
 //!
-//! | attribute | position | meaning |
-//! |---|---|---|
-//! | `table = "name"` | struct | table name, used only in error messages; defaults to the type name |
-//! | `primary_key` | field | required, exactly one |
-//! | `index` | field | secondary index on this field |
-//! | `index(unique)` | field | unique secondary index |
-//!
-//! An index is always named after its field. There is no rename knob: the name
-//! is not a string anyone types, it is the associated const above, so renaming
-//! it would only decouple the const from the field it reads.
-//!
-//! There is no `skip`: nothing is serialised, so every field is simply carried
-//! along in the struct. Fields need no traits beyond what `Versioned` requires
-//! of the struct as a whole.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -62,7 +53,7 @@ use syn::{
     Data, DeriveInput, Field, Fields, Ident, LitStr, Type, parse_macro_input, spanned::Spanned,
 };
 
-/// Derive `Versioned`. See the module docs.
+/// Derive `Versioned`. Documented at `mvcc::Mvcc`, which is how users reach it.
 #[proc_macro_derive(Mvcc, attributes(mvcc))]
 pub fn derive_mvcc(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -125,7 +116,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         })?;
     }
 
-    // --- fields -------------------------------------------------------------
     let fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => &named.named,
@@ -176,7 +166,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         )
     })?;
 
-    // --- generated pieces ---------------------------------------------------
     let index_count = indexes.len();
     let index_entries = indexes.iter().map(|(field, _, unique)| {
         let index_name = field.to_string();
