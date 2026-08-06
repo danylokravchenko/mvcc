@@ -1,8 +1,6 @@
 # MVCC
 
-Multi-version concurrency control out-of-box for ordinary Rust structs. Add
-`#[derive(Mvcc)]` and get transactions, snapshot isolation, secondary indexes,
-and a serializable level that actually is.
+**ACI, hold the D.** Three quarters of a database, for ordinary Rust structs. Add `#[derive(Mvcc)]` and get atomic transactions, enforced constraints, and four isolation levels including a serializable one that actually is.
 
 ```rust
 #[derive(Mvcc, Clone, Debug)]
@@ -25,9 +23,14 @@ db.transaction(|tx| {
 })?;
 ```
 
-**It is not durable.** Everything lives in memory and nothing survives the
-process. See [Scope](#scope) before going further — that is the first thing to
-decide, not the last.
+| | | |
+| --- | --- | --- |
+| **A**tomicity | ✔ | a transaction commits whole or not at all; a dropped one rolls back |
+| **C**onsistency | ✔ | primary keys and unique indexes are enforced against the committed database, and `Serializable` preserves any invariant your code checks |
+| **I**solation | ✔ | four levels, verified anomaly by anomaly against [Hermitage](#verified-not-asserted) |
+| **D**urability | ✘ | nothing is written to disk, ever |
+
+**The missing letter is the one to decide on first.** Everything lives in memory and nothing survives the process — no WAL, no recovery, no `data_dir`. See [Scope](#scope) before going further.
 
 ---
 
@@ -45,7 +48,9 @@ decide, not the last.
 
 ## Scope
 
-This is a database's **concurrency control** without a database's **storage layer**. Transactions, isolation levels, version chains, conflict detection are part of the project. The project doesn't come with WAL, checkpoints, `data_dir`, nor recovery.
+This is a database's **concurrency control** without a database's **storage layer** — atomicity, consistency and isolation, but no durability. Transactions, isolation levels, version chains, conflict detection are part of the project. The project doesn't come with WAL, checkpoints, `data_dir`, nor recovery.
+
+Which is a deliberate trade rather than an unfinished one: durability is what forces `fsync` onto the commit path, and dropping it is why a commit here costs a few atomic operations instead of a disk round-trip. What you lose is everything, on process exit.
 
 ## When to use it
 
@@ -105,6 +110,13 @@ Because the snapshot is fixed, a transaction's view never changes underneath it,
 First-updater-wins. A writer takes the slot's lock with a compare-exchange; if another transaction already holds it, the write fails immediately with `WriteConflict` rather than waiting. Waiting would reintroduce deadlock detection, which is one of the things MVCC removes.
 
 New versions are tagged as in-flight — invisible to everyone but their author — until commit stamps them with a real timestamp. That makes a commit atomic to readers: they see all of a transaction or none of it, never half.
+
+### Unique constraints
+
+A unique index is enforced against the **committed database**, not against your snapshot, at every isolation level. Two consequences worth knowing:
+
+- An insert fails with `DuplicateKey` if the key is taken by a row committed *after* your snapshot — a row you cannot otherwise see. A constraint is a property of the database; asking whether your snapshot happens to show the collision would be asking the wrong question. Postgres makes the same departure.
+- Two transactions in flight at once cannot both take the same key. Neither can see the other's rows, so instead each claims the key for the duration; the second gets a retriable `WriteConflict`, exactly as it would for a contended row.
 
 ### Deleting
 
@@ -239,7 +251,7 @@ if err.is_retriable() { /* WriteConflict or SerializationFailure */ }
 
 | error | retriable | meaning |
 | --- | --- | --- |
-| `WriteConflict` | ✔ | someone else wrote this record first |
+| `WriteConflict` | ✔ | someone else wrote this record, or claimed this unique key, first |
 | `SerializationFailure` | ✔ | committing would not have been serializable |
 | `DuplicateKey` | ✘ | the value violates a unique index |
 | `PrimaryKeyChanged` | ✘ | an `update` tried to change the primary key |

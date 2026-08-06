@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use mvcc::{Config, Database, Error, Mvcc, Result, Serializable, Snapshot};
+use mvcc::{Config, Database, Error, Mvcc, ReadCommitted, Result, Serializable, Snapshot};
 
 #[derive(Mvcc, Clone, Debug)]
 #[mvcc(table = "rows")]
@@ -304,5 +304,161 @@ fn contended_serializable_transfers_conserve_and_terminate() -> Result<()> {
     let mut tx = db.begin();
     let total: i64 = tx.scan::<Row>()?.iter().map(|r| r.value).sum();
     assert_eq!(total, KEYS as i64 * 1_000, "money was created or destroyed");
+    Ok(())
+}
+
+/// A unique index under a genuine race, rather than a hand-built interleaving.
+///
+/// Every thread tries to take the same key at the same time, once per round,
+/// each with its own primary key — so no two of them touch a common slot and
+/// nothing in first-updater-wins, the snapshot, or SSI is between them. The
+/// only thing that is, is the claim on the index key.
+///
+/// The failure this guards is quiet: a duplicate is not a crash and not a torn
+/// read, so a test that only watched for those would pass while the constraint
+/// silently did nothing. Checked by breaking it — with the claim removed, every
+/// round admits two to four winners.
+#[test]
+fn only_one_transaction_may_take_a_unique_key() -> Result<()> {
+    use std::sync::Barrier;
+
+    #[derive(Mvcc, Clone, Debug)]
+    #[mvcc(table = "unique_rows")]
+    struct Member {
+        #[mvcc(primary_key)]
+        id: u64,
+        #[mvcc(index(unique))]
+        email: String,
+    }
+
+    const THREADS: u64 = 4;
+    const ROUNDS: u64 = 200;
+
+    let db = Arc::new(Database::open(Config::in_memory())?);
+    db.register::<Member>()?;
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let winners = Arc::new(AtomicU64::new(0));
+
+    let threads: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            thread::spawn(move || -> Result<()> {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    let email = format!("round-{round}@example.com");
+                    let outcome = db.transaction(|tx| {
+                        tx.insert(Member {
+                            id: round * THREADS + t,
+                            email: email.clone(),
+                        })
+                    });
+                    match outcome {
+                        Ok(()) => {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // The two ways of losing: the key was already committed
+                        // by the winner, or the winner was still in flight and
+                        // the retries ran out.
+                        Err(Error::DuplicateKey { .. } | Error::WriteConflict { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    for t in threads {
+        t.join().expect("worker panicked")?;
+    }
+
+    // One winner per round, and — the assertion that actually catches a lost
+    // constraint — one row per key in the table.
+    let mut tx = db.begin();
+    let rows = tx.scan::<Member>()?;
+    assert_eq!(
+        rows.len(),
+        ROUNDS as usize,
+        "{} rows for {ROUNDS} unique keys",
+        rows.len()
+    );
+    let mut emails: Vec<String> = rows.iter().map(|m| m.email.clone()).collect();
+    emails.sort();
+    let distinct = emails.len();
+    emails.dedup();
+    assert_eq!(emails.len(), distinct, "a unique key was taken twice");
+    assert_eq!(
+        winners.load(Ordering::Relaxed),
+        ROUNDS,
+        "exactly one transaction per round may win"
+    );
+    Ok(())
+}
+
+/// An insert must never quietly become an update.
+///
+/// The primary key check in `insert` runs before the slot lock, so under a race
+/// it is stale by the time the write lands: every thread here looks at a key
+/// that does not exist yet, and only then contends for the slot. Above
+/// `ReadCommitted` first-committer-wins catches the loser, which is why this
+/// runs at `ReadCommitted` — the level with no such check, and the only one
+/// where the stale look was the last word.
+///
+/// The symptom is a lost insert rather than a crash: two transactions both
+/// report success and one row is left holding one of the two values.
+#[test]
+fn a_racing_insert_does_not_overwrite_a_committed_row() -> Result<()> {
+    use std::sync::Barrier;
+
+    const THREADS: u64 = 4;
+    const ROUNDS: u64 = 200;
+
+    let db = Arc::new(Database::open(Config::in_memory())?);
+    db.register::<Row>()?;
+    let barrier = Arc::new(Barrier::new(THREADS as usize));
+    let winners = Arc::new(AtomicU64::new(0));
+
+    let threads: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            thread::spawn(move || -> Result<()> {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    // One fresh key per round, contended by every thread.
+                    let outcome = db.transaction_with::<ReadCommitted, _, _>(|tx| {
+                        tx.insert(Row {
+                            id: round,
+                            value: t as i64,
+                            label: format!("by-{t}"),
+                        })
+                    });
+                    match outcome {
+                        Ok(()) => {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(Error::DuplicateKey { .. } | Error::WriteConflict { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    for t in threads {
+        t.join().expect("worker panicked")?;
+    }
+
+    assert_eq!(
+        winners.load(Ordering::Relaxed),
+        ROUNDS,
+        "every key must have exactly one successful inserter"
+    );
+    let mut tx = db.begin();
+    assert_eq!(tx.scan::<Row>()?.len(), ROUNDS as usize);
     Ok(())
 }

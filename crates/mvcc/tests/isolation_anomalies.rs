@@ -368,6 +368,253 @@ fn unique_indexes_reject_duplicates_and_allow_reuse_after_delete() -> Result<()>
     Ok(())
 }
 
+/// A unique index is a constraint on the *database*, so the tests below assert
+/// it at every isolation level rather than only the strongest. Nothing about
+/// snapshot isolation is supposed to make a duplicate reachable.
+mod unique_under_concurrency {
+    use super::*;
+    use mvcc::{IsolationLevel, RepeatableRead};
+
+    #[derive(Mvcc, Clone, Debug)]
+    #[mvcc(table = "members")]
+    struct Member {
+        #[mvcc(primary_key)]
+        id: u64,
+        #[mvcc(index(unique))]
+        email: String,
+    }
+
+    fn member(id: u64, email: &str) -> Member {
+        Member {
+            id,
+            email: email.into(),
+        }
+    }
+
+    fn empty_db() -> Result<Database> {
+        let db = Database::open(Config::in_memory())?;
+        db.register::<Member>()?;
+        Ok(db)
+    }
+
+    fn holders_of(db: &Database, email: &str) -> usize {
+        let owned = email.to_string();
+        db.begin()
+            .scan_where::<Member, _>(move |m| m.email == owned)
+            .expect("scan")
+            .len()
+    }
+
+    /// Two transactions in flight at once, each inserting a different primary
+    /// key with the same unique email. Neither can see the other's row — that
+    /// is what snapshot isolation is — so the check alone cannot catch this and
+    /// the claim has to.
+    fn overlapping_inserts_collide<I: IsolationLevel>() -> Result<()> {
+        let db = empty_db()?;
+
+        let mut a = db.begin_with::<I>();
+        let mut b = db.begin_with::<I>();
+
+        a.insert(member(1, "dup@example.com"))?;
+        let second = b.insert(member(2, "dup@example.com"));
+
+        assert!(
+            matches!(second, Err(Error::WriteConflict { .. })),
+            "{}: the second inserter must be turned away while the first is in \
+             flight, got {second:?}",
+            I::NAME
+        );
+
+        a.commit()?;
+        drop(b);
+
+        assert_eq!(
+            holders_of(&db, "dup@example.com"),
+            1,
+            "{}: exactly one row may hold the key",
+            I::NAME
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_inserts_collide_at_every_level() -> Result<()> {
+        overlapping_inserts_collide::<ReadCommitted>()?;
+        overlapping_inserts_collide::<RepeatableRead>()?;
+        overlapping_inserts_collide::<Snapshot>()?;
+        overlapping_inserts_collide::<Serializable>()
+    }
+
+    /// The other half: the winner has already committed, but the loser's
+    /// snapshot predates it. Checking uniqueness at that snapshot would report
+    /// the key as free, so the check reads the current committed state instead
+    /// — deliberately outside the transaction's own view.
+    fn insert_after_someone_elses_commit_collides<I: IsolationLevel>() -> Result<()> {
+        let db = empty_db()?;
+
+        // Begins first, so its snapshot cannot include the insert below.
+        let mut late = db.begin_with::<I>();
+        db.transaction(|tx| tx.insert(member(1, "dup@example.com")))?;
+
+        let outcome = late.insert(member(2, "dup@example.com"));
+        assert!(
+            matches!(outcome, Err(Error::DuplicateKey { .. })),
+            "{}: the key is taken in the committed database, whatever this \
+             transaction's snapshot shows, got {outcome:?}",
+            I::NAME
+        );
+        drop(late);
+
+        assert_eq!(holders_of(&db, "dup@example.com"), 1, "{}", I::NAME);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_after_someone_elses_commit_collides_at_every_level() -> Result<()> {
+        insert_after_someone_elses_commit_collides::<ReadCommitted>()?;
+        insert_after_someone_elses_commit_collides::<RepeatableRead>()?;
+        insert_after_someone_elses_commit_collides::<Snapshot>()?;
+        insert_after_someone_elses_commit_collides::<Serializable>()
+    }
+
+    /// An update moving a row onto a key is the same collision as an insert
+    /// taking it, and goes through the same claim.
+    #[test]
+    fn overlapping_updates_onto_one_key_collide() -> Result<()> {
+        let db = empty_db()?;
+        db.transaction(|tx| {
+            tx.insert(member(1, "a@example.com"))?;
+            tx.insert(member(2, "b@example.com"))?;
+            Ok(())
+        })?;
+
+        let mut a = db.begin();
+        let mut b = db.begin();
+
+        assert!(a.update::<Member>(&1, |m| m.email = "c@example.com".into())?);
+        let second = b.update::<Member>(&2, |m| m.email = "c@example.com".into());
+        assert!(
+            matches!(second, Err(Error::WriteConflict { .. })),
+            "got {second:?}"
+        );
+
+        a.commit()?;
+        drop(b);
+        assert_eq!(holders_of(&db, "c@example.com"), 1);
+        Ok(())
+    }
+
+    /// A claim is a reservation, not a grave. Everything a failed or abandoned
+    /// transaction claimed has to come back, or one bad insert would burn a key
+    /// for the life of the process.
+    #[test]
+    fn an_abandoned_claim_is_released() -> Result<()> {
+        let db = empty_db()?;
+
+        let mut doomed = db.begin();
+        doomed.insert(member(1, "free@example.com"))?;
+        drop(doomed);
+
+        db.transaction(|tx| tx.insert(member(2, "free@example.com")))?;
+        assert_eq!(holders_of(&db, "free@example.com"), 1);
+
+        // Also when the transaction survives the failure: a rejected insert
+        // must not leave the key it was refused holding a claim.
+        let mut rejected = db.begin();
+        assert!(rejected.insert(member(3, "free@example.com")).is_err());
+        drop(rejected);
+
+        db.transaction(|tx| tx.delete::<Member>(&2).map(|_| ()))?;
+        db.transaction(|tx| tx.insert(member(4, "free@example.com")))?;
+        assert_eq!(holders_of(&db, "free@example.com"), 1);
+        Ok(())
+    }
+
+    /// One transaction may take a key, release it by deleting the row, and take
+    /// it again — the claim is per transaction, not per statement, so its own
+    /// second write must not be turned away as a conflict with itself.
+    #[test]
+    fn a_transaction_does_not_collide_with_itself() -> Result<()> {
+        let db = empty_db()?;
+        db.transaction(|tx| {
+            tx.insert(member(1, "self@example.com"))?;
+            assert!(matches!(
+                tx.insert(member(2, "self@example.com")),
+                Err(Error::DuplicateKey { .. })
+            ));
+            tx.delete::<Member>(&1)?;
+            tx.insert(member(2, "self@example.com"))
+        })?;
+        assert_eq!(holders_of(&db, "self@example.com"), 1);
+        Ok(())
+    }
+
+    /// The primary key is a unique constraint too, and had the same hole at
+    /// `ReadCommitted`, which has no first-committer-wins check to fall back
+    /// on: the insert would land on top of the committed row as if it were an
+    /// update.
+    fn insert_over_a_committed_primary_key_fails<I: IsolationLevel>() -> Result<()> {
+        let db = empty_db()?;
+
+        let mut late = db.begin_with::<I>();
+        db.transaction(|tx| tx.insert(member(7, "first@example.com")))?;
+
+        let outcome = late.insert(member(7, "second@example.com"));
+        assert!(
+            outcome.is_err(),
+            "{}: inserting over a committed primary key must fail, got \
+             {outcome:?}",
+            I::NAME
+        );
+        drop(late);
+
+        let mut check = db.begin();
+        assert_eq!(
+            check.get::<Member>(&7)?.map(|m| m.email.clone()),
+            Some("first@example.com".to_string()),
+            "{}: and must not have overwritten it",
+            I::NAME
+        );
+        Ok(())
+    }
+
+    /// The other direction of that check, and the thing it could plausibly have
+    /// broken: a deleted key is free again. A tombstone is a version like any
+    /// other, so "the slot holds a live record" is not the same question as
+    /// "the slot exists", and answering the second would make every primary key
+    /// single-use.
+    #[test]
+    fn a_deleted_primary_key_can_be_reused() -> Result<()> {
+        let db = empty_db()?;
+
+        db.transaction(|tx| tx.insert(member(1, "first@example.com")))?;
+        db.transaction(|tx| tx.delete::<Member>(&1).map(|_| ()))?;
+        db.transaction(|tx| tx.insert(member(1, "second@example.com")))?;
+
+        // Including within a single transaction, where the tombstone the
+        // re-insert has to see past is the transaction's own uncommitted one.
+        db.transaction(|tx| {
+            tx.delete::<Member>(&1)?;
+            tx.insert(member(1, "third@example.com"))
+        })?;
+
+        let mut tx = db.begin();
+        assert_eq!(
+            tx.get::<Member>(&1)?.map(|m| m.email.clone()),
+            Some("third@example.com".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn insert_over_a_committed_primary_key_fails_at_every_level() -> Result<()> {
+        insert_over_a_committed_primary_key_fails::<ReadCommitted>()?;
+        insert_over_a_committed_primary_key_fails::<RepeatableRead>()?;
+        insert_over_a_committed_primary_key_fails::<Snapshot>()?;
+        insert_over_a_committed_primary_key_fails::<Serializable>()
+    }
+}
+
 #[test]
 fn secondary_index_scans_respect_visibility() -> Result<()> {
     let db = db_with(&[(1, "red", 1), (2, "red", 2), (3, "blue", 3)])?;

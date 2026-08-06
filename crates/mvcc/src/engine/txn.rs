@@ -14,7 +14,7 @@ use crate::core::{
 use crossbeam_epoch::{Guard, Owned, Shared};
 
 use crate::engine::ssi::TxnState;
-use crate::engine::store::{Database, Slot, Table, Version};
+use crate::engine::store::{Claim, Database, Slot, Table, Version};
 
 /// A write this transaction has installed but not yet committed.
 ///
@@ -99,6 +99,28 @@ impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
             }
         }
         readers
+    }
+}
+
+/// A unique index key this transaction holds until it finishes.
+///
+/// Type-erased for the same reason [`WriteOp`] is: one transaction can claim
+/// keys on several tables.
+trait UniqueClaim {
+    fn release(&self);
+}
+
+struct IndexClaim<'db, T: Versioned> {
+    table: &'db Table<T>,
+    position: usize,
+    key: IndexKey,
+    txn: TxnId,
+}
+
+impl<T: Versioned> UniqueClaim for IndexClaim<'_, T> {
+    fn release(&self) {
+        self.table
+            .release_unique(self.position, &self.key, self.txn);
     }
 }
 
@@ -323,6 +345,14 @@ pub struct Transaction<'db, I: IsolationLevel> {
     writes: Vec<Box<dyn WriteOp<'db> + 'db>>,
     /// Empty, and never pushed to, unless `I::VALIDATES_READS`.
     reads: Vec<Box<dyn ReadValidation<'db> + 'db>>,
+    /// Unique index keys held until this transaction ends. Empty for tables
+    /// with no unique index, which is the common case.
+    ///
+    /// Separate from `writes` rather than folded into `SlotWrite` because a
+    /// claim outlives the attempt that took it: `insert` claims before it
+    /// writes, and the write can still fail on the slot lock. A claim recorded
+    /// only on success would then be held by nobody and released by nothing.
+    claims: Vec<Box<dyn UniqueClaim + 'db>>,
     /// Tables already resolved by this transaction.
     ///
     /// The registry lock is uncontended in isolation but it is a *single*
@@ -351,6 +381,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             db,
             writes: Vec::new(),
             reads: Vec::new(),
+            claims: Vec::new(),
             table_cache: Vec::new(),
             done: false,
             _level: PhantomData,
@@ -468,11 +499,18 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
 
     /// Install a new version of `key`'s record, or fail if the slot is
     /// contended or was committed under us.
+    ///
+    /// `fresh` marks an insert: the slot must hold no live record once we own
+    /// it. Checking that here rather than in `insert` is the point — the slot
+    /// lock is the only thing that stops another transaction committing between
+    /// the check and the write, so the authoritative check has to be on this
+    /// side of it.
     fn write<T: Versioned>(
         &mut self,
         table: &'db Table<T>,
         key: &T::Key,
         value: Option<T>,
+        fresh: bool,
     ) -> Result<()> {
         let slot = table.slot_or_create(key, &self.guard);
 
@@ -502,6 +540,23 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             slot.unlock(self.id);
             return Err(Error::WriteConflict {
                 table: T::TABLE_NAME,
+            });
+        }
+
+        // Primary key uniqueness, decided under the lock. The snapshot-relative
+        // check in `insert` is an early exit and cannot be the last word: below
+        // `Serializable` a transaction's snapshot may predate a commit that
+        // took this very key, and `ReadCommitted` has no first-committer-wins
+        // check above to catch it either.
+        if fresh
+            && slot
+                .read_committed_now(self.id, &self.guard)
+                .is_some_and(|v| v.value.is_some())
+        {
+            slot.unlock(self.id);
+            return Err(Error::DuplicateKey {
+                table: T::TABLE_NAME,
+                index: "primary_key",
             });
         }
 
@@ -539,10 +594,87 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         Ok(())
     }
 
+    /// Take a claim on every unique index key `record` will occupy, and check
+    /// that no committed record already holds one.
+    ///
+    /// `previous` is the version this write displaces, or `None` for an insert.
+    /// An index whose key is unchanged is skipped: the row already holds that
+    /// key, so there is nothing to claim and nobody to collide with — the same
+    /// reasoning, and the same saved lock acquisition, as
+    /// [`Table::index_record`].
+    ///
+    /// Returns the claims to record, which the caller must push onto
+    /// `self.claims`. It cannot push them itself: `previous` borrows out of the
+    /// epoch guard, which is `self`, so this method cannot also take `&mut
+    /// self`. Claims taken before a failure are released here, since a write
+    /// that is not happening should not keep a key reserved.
+    fn claim_unique_keys<T: Versioned>(
+        &self,
+        table: &'db Table<T>,
+        record: &T,
+        previous: Option<&T>,
+    ) -> Result<Vec<Box<dyn UniqueClaim + 'db>>> {
+        let mut claimed: Vec<Box<dyn UniqueClaim + 'db>> = Vec::new();
+        let own_key = record.key();
+
+        for (position, desc) in T::indexes().iter().enumerate() {
+            if !desc.unique {
+                continue;
+            }
+            let index_key = (desc.extract)(record);
+            if previous.is_some_and(|prev| (desc.extract)(prev) == index_key) {
+                continue;
+            }
+
+            let outcome = match table.try_claim_unique(position, &index_key, self.id) {
+                // Another transaction is writing this key and we cannot see its
+                // rows. Retriable, and the same answer first-updater-wins gives
+                // for a contended slot — waiting instead would reintroduce
+                // deadlock detection.
+                Claim::Contended => Err(Error::WriteConflict {
+                    table: T::TABLE_NAME,
+                }),
+                claim => {
+                    // Recorded before the check, so a failure below still
+                    // releases it. `Held` is not recorded: an earlier write in
+                    // this transaction owns that claim and will release it.
+                    if claim == Claim::Acquired {
+                        claimed.push(Box::new(IndexClaim {
+                            table,
+                            position,
+                            key: index_key.clone(),
+                            txn: self.id,
+                        }));
+                    }
+                    if table.unique_key_taken(position, &index_key, &own_key, self.id, &self.guard)
+                    {
+                        Err(Error::DuplicateKey {
+                            table: T::TABLE_NAME,
+                            index: desc.name,
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+
+            if let Err(e) = outcome {
+                for claim in &claimed {
+                    claim.release();
+                }
+                return Err(e);
+            }
+        }
+
+        Ok(claimed)
+    }
+
     /// Insert a new record.
     ///
     /// Fails with [`Error::DuplicateKey`] if the primary key already has a
-    /// visible, non-deleted version, or if a unique index would be violated.
+    /// visible, non-deleted version, or if a unique index would be violated,
+    /// and with [`Error::WriteConflict`] if another in-flight transaction is
+    /// writing one of the same unique keys.
     pub fn insert<T: Versioned>(&mut self, value: T) -> Result<()> {
         self.ensure_live()?;
         let table = self.table::<T>()?;
@@ -560,14 +692,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        if let Some(index) = table.unique_violation(&value, snapshot, self.id, &self.guard) {
-            return Err(Error::DuplicateKey {
-                table: T::TABLE_NAME,
-                index,
-            });
-        }
+        let claimed = self.claim_unique_keys(table, &value, None)?;
+        self.claims.extend(claimed);
 
-        self.write(table, &key, Some(value))
+        self.write(table, &key, Some(value), true)
     }
 
     /// Read-modify-write by primary key. Returns `false` if the record does not
@@ -604,14 +732,13 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             });
         }
 
-        if let Some(index) = table.unique_violation(&next, snapshot, self.id, &self.guard) {
-            return Err(Error::DuplicateKey {
-                table: T::TABLE_NAME,
-                index,
-            });
-        }
+        // Borrows `current` out of the epoch guard, so it has to finish before
+        // the `&mut self` calls below — which is why the claims come back to be
+        // recorded rather than being recorded in there.
+        let claimed = self.claim_unique_keys(table, &next, Some(current))?;
+        self.claims.extend(claimed);
 
-        self.write(table, key, Some(next))?;
+        self.write(table, key, Some(next), false)?;
         Ok(true)
     }
 
@@ -635,7 +762,7 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             return Ok(false);
         }
 
-        self.write::<T>(table, key, None)?;
+        self.write::<T>(table, key, None, false)?;
         Ok(true)
     }
 
@@ -978,9 +1105,23 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
             }
         }
 
+        // After the stamping loop, never before. A claim is what stands in for
+        // rows that are invisible because they are not committed yet; releasing
+        // it while that is still true would let the next claimant check against
+        // a state these writes are missing from, which is the whole hole this
+        // is closing. Once `begin` holds a real timestamp, they are visible to
+        // `Slot::read_committed_now` and the claim has nothing left to do.
+        self.release_claims();
         self.db.oracle().release_snapshot(self.id, self.snapshot);
         self.done = true;
         Ok(())
+    }
+
+    /// Give up every unique index key this transaction holds.
+    fn release_claims(&mut self) {
+        for claim in self.claims.drain(..) {
+            claim.release();
+        }
     }
 
     /// Abort and discard every write.
@@ -999,6 +1140,10 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
         for write in self.writes.iter().rev() {
             write.abort();
         }
+        // Safe in either order here: the versions are unlinked above, so a
+        // claimant that arrives after this point cannot find them whenever it
+        // looks.
+        self.release_claims();
         // Frees this transaction's SIREAD locks: an aborted transaction's reads
         // never constrained anyone. See `TxnState::is_expired`.
         if let Some(state) = &self.state {

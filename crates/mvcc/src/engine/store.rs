@@ -217,6 +217,45 @@ impl<T> Slot<T> {
         }
     }
 
+    /// The newest version that is committed, or written by `reader` itself —
+    /// at no snapshot in particular.
+    ///
+    /// Every other read in the engine is snapshot-relative; this one
+    /// deliberately is not, and it exists for exactly one caller: unique index
+    /// enforcement. A constraint is a property of the *database*, not of a
+    /// transaction's view of it, so checking it at the caller's snapshot asks
+    /// the wrong question — the row that would collide may have been committed
+    /// after that snapshot was taken, and is no less real for it. Postgres
+    /// makes the same departure, checking uniqueness against the live index
+    /// rather than the reader's MVCC snapshot.
+    ///
+    /// Returns the head-most version whose `begin` is committed or ours.
+    /// Timestamps increase toward the head among committed versions — the slot
+    /// lock serialises installation, and a commit stamp is taken after the
+    /// install it belongs to — so the first such version is the current one,
+    /// and its `end` needs no examination: whatever ended it would be nearer
+    /// the head and would have been returned instead.
+    pub(crate) fn read_committed_now<'g>(
+        &self,
+        reader: TxnId,
+        guard: &'g Guard,
+    ) -> Option<&'g Version<T>> {
+        let mut cur = self.latest.load(Ordering::Acquire, guard);
+        loop {
+            // SAFETY: as in `Slot::read`.
+            let v = unsafe { cur.as_ref() }?;
+            match Visibility::decode(v.begin.load(Ordering::Acquire)) {
+                Visibility::CommittedAt(_) => return Some(v),
+                Visibility::InFlight(id) if id == reader => return Some(v),
+                // Someone else's uncommitted write. Skipping it is what makes
+                // the *claim* rather than this walk the thing that keeps two
+                // in-flight writers off one key.
+                Visibility::InFlight(_) => {}
+            }
+            cur = v.prev.load(Ordering::Acquire, guard);
+        }
+    }
+
     /// Take the write lock, first-updater-wins.
     ///
     /// Returns `false` if another transaction holds it. We abort rather than
@@ -261,6 +300,38 @@ pub(crate) struct Table<T: Versioned> {
     /// its new row against every registered predicate, and a match is an
     /// incoming rw-antidependency.
     predicate_locks: Mutex<Vec<PredicateLock<T>>>,
+    /// Unique index keys claimed by in-flight transactions, one map per index.
+    ///
+    /// This is first-updater-wins applied to an index key instead of a slot,
+    /// and it is what makes a unique constraint hold under concurrency.
+    /// [`Table::unique_key_taken`] can only see what is already committed; two
+    /// transactions inserting the same key into two *different* slots are
+    /// invisible to each other by construction, because neither one's version
+    /// is committed while the other is looking. Nothing in the slot lock, the
+    /// snapshot, or SSI covers that — the collision is between rows that do not
+    /// share a slot, and for an inserted row there is no earlier version to
+    /// have read.
+    ///
+    /// Claims are taken before the check and released after the writes are
+    /// stamped, so a claim's whole lifetime covers the window in which the
+    /// claimant's rows are invisible to everyone else. Whoever claims next
+    /// therefore sees them.
+    ///
+    /// Non-unique indexes keep an entry so positions line up with
+    /// [`Versioned::indexes`]; it is never touched.
+    unique_claims: Vec<Mutex<HashMap<IndexKey, TxnId>>>,
+}
+
+/// What [`Table::try_claim_unique`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Claim {
+    /// The key was free and is now ours. The caller owns releasing it.
+    Acquired,
+    /// We already held it, from an earlier write in the same transaction.
+    /// Releasing it is the earlier claim's job, not this one's.
+    Held,
+    /// Another in-flight transaction holds it.
+    Contended,
 }
 
 impl<T: Versioned> Drop for Table<T> {
@@ -309,6 +380,10 @@ impl<T: Versioned> Table<T> {
                 .map(|_| RwLock::new(BTreeMap::new()))
                 .collect(),
             predicate_locks: Mutex::new(Vec::new()),
+            unique_claims: T::indexes()
+                .iter()
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
         }
     }
 
@@ -548,46 +623,69 @@ impl<T: Versioned> Table<T> {
             .collect()
     }
 
-    /// Whether a unique index would be violated by `record`, given a reader's
-    /// snapshot.
-    pub(crate) fn unique_violation(
+    /// Claim `index_key` on unique index `position` for `txn`, unless another
+    /// in-flight transaction holds it.
+    ///
+    /// See [`Table::unique_claims`] for why this exists at all.
+    pub(crate) fn try_claim_unique(
         &self,
-        record: &T,
-        snapshot: Timestamp,
-        reader: TxnId,
-        guard: &Guard,
-    ) -> Option<&'static str> {
-        let own_key = record.key();
-        for (position, desc) in T::indexes().iter().enumerate() {
-            if !desc.unique {
-                continue;
-            }
-            let index_key = (desc.extract)(record);
-            let candidates = {
-                let map = self.secondary[position].read();
-                map.get(&index_key).cloned().unwrap_or_default()
-            };
-            for candidate in candidates {
-                if candidate == own_key {
-                    continue;
-                }
-                // Recheck: the candidate may have moved off this key, or its
-                // visible version may not exist at this snapshot.
-                let Some(slot) = self.slot(&candidate, guard) else {
-                    continue;
-                };
-                let Some(version) = slot.read(snapshot, reader, guard) else {
-                    continue;
-                };
-                let Some(value) = version.value.as_ref() else {
-                    continue;
-                };
-                if (desc.extract)(value) == index_key {
-                    return Some(desc.name);
-                }
+        position: usize,
+        index_key: &IndexKey,
+        txn: TxnId,
+    ) -> Claim {
+        let mut claims = self.unique_claims[position].lock();
+        match claims.get(index_key) {
+            Some(&owner) if owner == txn => Claim::Held,
+            Some(_) => Claim::Contended,
+            None => {
+                claims.insert(index_key.clone(), txn);
+                Claim::Acquired
             }
         }
-        None
+    }
+
+    /// Drop a claim taken by [`Table::try_claim_unique`].
+    ///
+    /// Checks the owner rather than removing blindly, so that releasing a claim
+    /// this transaction does not hold cannot evict someone else's.
+    pub(crate) fn release_unique(&self, position: usize, index_key: &IndexKey, txn: TxnId) {
+        let mut claims = self.unique_claims[position].lock();
+        if claims.get(index_key) == Some(&txn) {
+            claims.remove(index_key);
+        }
+    }
+
+    /// Whether some record other than `own_key` currently holds `index_key`.
+    ///
+    /// "Currently" as in [`Slot::read_committed_now`]: committed, at whatever
+    /// timestamp, plus `reader`'s own uncommitted writes. Only sound as half of
+    /// a claim — on its own it cannot see a concurrent in-flight writer of the
+    /// same key.
+    pub(crate) fn unique_key_taken(
+        &self,
+        position: usize,
+        index_key: &IndexKey,
+        own_key: &T::Key,
+        reader: TxnId,
+        guard: &Guard,
+    ) -> bool {
+        let extract = T::indexes()[position].extract;
+        let candidates = {
+            let map = self.secondary[position].read();
+            map.get(index_key).cloned().unwrap_or_default()
+        };
+        candidates.into_iter().any(|candidate| {
+            if candidate == *own_key {
+                return false;
+            }
+            // Recheck: index entries are candidates, not answers — the
+            // candidate may have moved off this key, been deleted, or belong to
+            // a write that rolled back.
+            self.slot(&candidate, guard)
+                .and_then(|slot| slot.read_committed_now(reader, guard))
+                .and_then(|version| version.value.as_ref())
+                .is_some_and(|value| extract(value) == *index_key)
+        })
     }
 }
 
