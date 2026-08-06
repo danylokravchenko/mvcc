@@ -13,10 +13,10 @@
 //! which a version was retired. See [`crate::engine::store`] for the chain it
 //! protects.
 //!
-//! The predecessor was an `Arc` per version, dropped when the last reference to
-//! it went away. Correct, and correct first — but it cost an atomic increment
-//! per read, a write to a shared cache line on the read path, which is exactly
-//! what MVCC exists to avoid. Reference counting loses to EBR here for the same
+//! An `Arc` per version, dropped when the last reference goes away, answers (2)
+//! correctly and is the obvious way to do it. It costs an atomic increment per
+//! read — a write to a shared cache line on the read path, which is exactly what
+//! MVCC exists to avoid. Reference counting loses to EBR here for the same
 //! reason the timestamp oracle avoids a shared counter.
 //!
 //! # How chains are pruned
@@ -59,8 +59,15 @@
 //! `&mut self`, which is a compile-time proof that no transaction exists — a
 //! `Transaction` borrows the database — and so that no slot resolved by one is
 //! still in use. It rebuilds each shard around its survivors, which drops the
-//! retained bytes to about 2 per key. Nothing on the read or write path pays for
-//! its existence.
+//! retained bytes to about 2 per key.
+//!
+//! Requiring exclusivity is a performance decision.
+//! Freeing slots concurrently means revalidating each write against the key
+//! map, or draining transactions behind a lock they all touch — either one puts
+//! synchronisation back on a path that has none today, and the append-only map
+//! is worth 1.9x on uniform point reads and 9.8x on contended ones at four
+//! threads — the shipped before-and-after, not the throwaway lock-deletion
+//! experiment `crate::engine::slotmap` tabulates.
 //!
 //! Those records are immortal during normal operation, and it is not a detail
 //! that can be changed here — `SlotMap::get` hands out a `&Slot<T>` borrowed from the *map*
@@ -154,7 +161,7 @@ use crate::core::Timestamp;
 pub struct GcStats {
     /// The oldest snapshot any live transaction still reads at, or the read
     /// watermark when there are none. Versions superseded at or before this are
-    /// reclaimable, so if it stops advancing, nothing else matters.
+    /// reclaimable.
     pub watermark: Timestamp,
     /// Live transactions. A number that only grows is the leak.
     pub active_transactions: usize,

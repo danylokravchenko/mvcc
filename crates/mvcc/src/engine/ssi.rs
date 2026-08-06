@@ -14,13 +14,14 @@
 //!
 //! # How each edge is found
 //!
-//! The two directions need different machinery, and this engine already had
-//! half of it:
+//! The two directions need different machinery, and snapshot isolation already
+//! supplies half of it:
 //!
 //! - **Outgoing** (`self →rw W`): re-run the read set at commit. Anything that
 //!   changed was changed by someone, and because revalidation reads at the
 //!   current read watermark, that someone has necessarily *committed*. This is
-//!   the check that used to abort on its own; now it only sets a flag.
+//!   the check snapshot isolation aborts on directly; here it only sets a flag,
+//!   because an outgoing edge alone does not make a cycle.
 //!
 //! - **Incoming** (`R →rw self`): needs to know who read the rows this
 //!   transaction wrote — a *SIREAD lock*. [`Slot`](crate::engine::store::Slot) keeps a

@@ -1,11 +1,9 @@
-//! The timestamp oracle — and the single most important scalability decision in
-//! the engine.
+//! The timestamp oracle.
 //!
 //! Every transaction takes a snapshot at begin and a timestamp at commit, and
-//! both used to run through a global mutex. Measurement put those two mutexes at
-//! roughly a third of the write path's cost at 8 threads; removing them
-//! entirely, as a throwaway experiment, moved write throughput from 1.23M to
-//! 1.79M ops/sec. Neither uses a lock now.
+//! neither takes a lock. A global mutex on each is the obvious implementation
+//! and costs roughly a third of the write path at 8 threads: deleting both as a
+//! throwaway experiment moves write throughput from 1.23M to 1.79M ops/sec.
 //!
 //! # The read watermark, without a mutex
 //!
@@ -14,22 +12,23 @@
 //! because the counter can name a commit whose versions are still being stamped
 //! — a reader at that timestamp would see a torn commit.
 //!
-//! Computing it used to mean a `BTreeSet` of in-flight timestamps under a mutex,
-//! walked on every commit. It is really a sequence-completion problem, so it is
-//! now a ring of atomics (the LMAX Disruptor sequencer pattern):
+//! Computing it from a `BTreeSet` of in-flight timestamps under a mutex, walked
+//! on every commit, is the direct approach. But it is really a sequence-
+//! completion problem, so this is a ring of atomics instead (the LMAX Disruptor
+//! sequencer pattern):
 //!
 //! ```text
 //!   completed[ts % RING] = ts        once `ts` has finished installing
 //!   watermark            advances    while completed[watermark + 1] == watermark + 1
 //! ```
 //!
-//! An in-flight commit leaves a hole and the watermark stops there — exactly the
-//! old semantics, with no lock and no allocation.
+//! An in-flight commit leaves a hole and the watermark stops there — the same
+//! semantics the `BTreeSet` gives, with no lock and no allocation.
 //!
 //! This needs commit timestamps to be **gap-free**, which is why transaction ids
-//! now come from their own counter. The two can no longer be told apart by
-//! value, and do not need to be: the tag bit in `crate::core::time` is what
-//! distinguishes an in-flight writer from a commit timestamp.
+//! come from their own counter. The two cannot be told apart by value, and do
+//! not need to be: the tag bit in `crate::core::time` is what distinguishes an
+//! in-flight writer from a commit timestamp.
 //!
 //! # The GC watermark, sharded
 //!
@@ -104,7 +103,7 @@ fn thread_slot() -> usize {
 /// epoch, so "commit, then read it back" would stop working without an extra
 /// wait; and SSI revalidates read sets against the read watermark, which would
 /// no longer be able to see same-epoch commits. It remains the right answer for
-/// a much larger machine, and it is a redesign rather than a setting.
+/// a much larger machine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OracleConfig {

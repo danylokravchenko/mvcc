@@ -31,7 +31,7 @@
 //! | data to survive a restart | an embedded database — `redb`, `sled`, `SQLite` |
 //! | more data than fits in RAM | anything with a buffer pool |
 //! | multiple processes | a real database server |
-//! | one map, one thread at a time | `RwLock<HashMap<K, V>>` — genuinely |
+//! | one map, one thread at a time | `RwLock<HashMap<K, V>>` |
 //! | queries by shape rather than by key | a query engine; this has no planner |
 //!
 //! # How it works
@@ -146,17 +146,16 @@
 //!
 //! Isolation behaviour is verified against [Hermitage], Martin Kleppmann's
 //! isolation test suite: all ten anomalies, each asserted *present or absent per
-//! level*, because a level that forbids too much is as wrong as one that forbids
-//! too little.
+//! level*.
 //!
 //! # Conflicts are normal
 //!
-//! Under MVCC a conflict is not an error condition — it is how the engine
-//! reports that two transactions could not both happen. [`Error::is_retriable`]
-//! draws the line that matters: [`WriteConflict`] and [`SerializationFailure`]
-//! mean re-run, and everything else is a programming mistake that will fail
-//! again identically. [`Database::transaction`] already loops on the retriable
-//! ones, so most code never matches on this at all.
+//! A conflict is the engine reporting that two transactions could not both
+//! happen. [`Error::is_retriable`] separates the two cases: [`WriteConflict`]
+//! and [`SerializationFailure`] mean re-run, and everything else is a
+//! programming mistake that will fail again identically.
+//! [`Database::transaction`] already loops on the retriable ones, so most code
+//! never matches on this at all.
 //!
 //! When scanning, prefer [`Transaction::scan_where`] over
 //! [`scan`][Transaction::scan] plus `.filter()`. The first hands the predicate to

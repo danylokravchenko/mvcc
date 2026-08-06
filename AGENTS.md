@@ -50,7 +50,7 @@ cargo test --workspace
 cargo bench -- 4                                        # only if you touched the engine
 ```
 
-Run all four before reporting a change as done. There is no CI in this repo, so the local run is the only check there is.
+Run all four before reporting a change as done. CI (`.github/workflows/test.yml`) runs the same checks on every push and PR, plus `cargo doc` with `-D warnings` — so a broken intra-doc link fails the build, and `cargo clippy` there is `-D warnings` rather than merely noisy.
 
 `cargo test --workspace` includes `tests/examples_run.rs`, which shells out and runs every example in release mode — so a full test run compiles the examples twice and takes noticeably longer than the test count suggests. That is intentional; do not "optimise" it away.
 
@@ -92,7 +92,11 @@ For a bug, the ideal first commit is the failing test alone.
 - If a `clippy.toml` threshold blocks you, split the function — do not raise the number. Each threshold carries a comment saying what it protects; raising one means editing that comment to explain why the old reasoning stopped holding.
 - **Comments explain why, not what**, at a higher density than usual: what a design choice protects, or what alternative was tried and rejected. Reasoning about lock-free code from the code alone is not realistic. Match the surrounding density.
 - Public items get doc comments, with a runnable example where the signature is not self-explanatory. Doc examples are compiled by `cargo test`.
+- **Docs are reference, not prose.** Say what it does, then what the caller cannot get from the signature — errors, panics, complexity, what lock it takes. Cut filler, hedging, praise for the design, parameter lists that repeat the types, and aphorisms or rhetorical closers. Mention an implementation detail only when it changes what the caller writes.
+- **No change history in docs.** No "previously", "renamed from", "added in v2", migration notes or dated asides — in doc comments, `README.md` or `CONTRIBUTING.md`. Git carries that. A rejected alternative stays where it stops the next reader re-trying it, written in the present tense and about the trade rather than the event. `DESIGN.md` is the exception: recording which decisions were taken and superseded is its job.
 - When a change invalidates something in `DESIGN.md`, update `DESIGN.md` in the same commit.
+
+The long version, covering doc comments, module docs, `README.md` and `CONTRIBUTING.md`, is the [`write-docs`](.claude/skills/write-docs/SKILL.md) skill.
 
 ## Commits
 

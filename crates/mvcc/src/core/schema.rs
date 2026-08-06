@@ -35,9 +35,9 @@ impl IndexKey {
 /// `#[derive(Mvcc)]` emits one of these as an associated const per indexed
 /// field, named after the field in upper case — `#[mvcc(index)] owner: u64`
 /// becomes `Item::OWNER: Index<Item, u64>`. Scans take the const rather than a
-/// string, so both halves of the old `scan_index("owner", …)` are checked: a
-/// wrong name is an unresolved item, and a range whose type does not match the
-/// indexed field fails to unify with `K` instead of silently matching nothing.
+/// name and a range, so both are checked at compile time: a wrong name is an
+/// unresolved item, and a range whose type does not match the indexed field
+/// fails to unify with `K` instead of silently matching nothing.
 ///
 /// It is `Copy` and holds only a position, so passing one costs nothing.
 pub struct Index<T, K> {

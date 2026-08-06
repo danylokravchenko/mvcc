@@ -47,7 +47,7 @@ impl Timestamp {
 pub struct TxnId(pub u64);
 
 impl TxnId {
-    /// A id belonging to no transaction.
+    /// An id belonging to no transaction.
     ///
     /// Reading with this id makes every in-flight version invisible, including
     /// the reader's own — which is what commit-time read validation wants: it

@@ -67,8 +67,7 @@
 //! lock is held.** The closure passed to `Transaction::update` is called before
 //! any lock is taken, and index key extraction runs on cloned candidates rather
 //! than under the index lock. There is no panic path that could leave a chain
-//! torn, so there was never anything for poisoning to protect — the 18 sites it
-//! required were pure noise.
+//! torn, so there is nothing for poisoning to protect.
 
 use parking_lot::{Mutex, RwLock};
 use std::any::{Any, TypeId};
@@ -129,11 +128,11 @@ pub(crate) struct Slot<T> {
     /// any kind. Writes are already serialised by `lock` below, so the only job
     /// left is making the load atomic against a concurrent store.
     ///
-    /// The reference count this replaced was the last shared write on the read
-    /// path, and it was expensive out of all proportion to its size. Isolated,
-    /// four threads reading four hot records ran 37x faster through a plain
-    /// reference than through `Arc::clone` — every read was dirtying a cache
-    /// line that every other reader of that record needed.
+    /// A reference count here would be a shared write on the read path, and it
+    /// costs out of all proportion to its size: isolated, four threads reading
+    /// four hot records run 37x faster through a plain reference than through
+    /// `Arc::clone`, because every read dirties a cache line that every other
+    /// reader of that record needs.
     pub(crate) latest: Atomic<Version<T>>,
     /// Transaction id currently writing this slot, or 0 if free.
     pub(crate) lock: AtomicU64,
@@ -437,9 +436,6 @@ impl<T> Slot<T> {
     ///   ten rows          5
     ///   a hundred rows    3
     /// ```
-    ///
-    /// Bounded and small, and the trade is deliberate: the alternative is the
-    /// quadratic scan above.
     const PRUNE_PROBE: usize = 8;
 
     /// Whether `v` was superseded at or before `gc`, and so is invisible to
@@ -465,7 +461,6 @@ impl<T> Slot<T> {
 /// primary key order. Borrowed from the caller's epoch pin, never cloned.
 type Matches<'g, T> = Vec<(<T as Versioned>::Key, &'g Version<T>)>;
 
-/// A registered table: the primary map plus any secondary indexes.
 /// Pruning a table without naming its record type.
 ///
 /// [`Database::tables`] is type-erased, so the sweep that collects records
@@ -487,6 +482,7 @@ pub(crate) trait Sweep: Send + Sync {
     fn compact(&self) -> usize;
 }
 
+/// A registered table: the primary map plus any secondary indexes.
 pub(crate) struct Table<T: Versioned> {
     /// Primary key to slot. Lock-free on the read path — see [`SlotMap`].
     slots: SlotMap<T>,
@@ -545,9 +541,9 @@ impl<T: Versioned> Drop for Table<T> {
     /// Free every version chain.
     ///
     /// Necessary because `Atomic` does not own its pointee — that is the whole
-    /// point of epoch reclamation, and it is what the `Arc` chain this replaced
-    /// used to do implicitly. Without this, dropping a `Database` leaks every
-    /// version it ever held.
+    /// point of epoch reclamation, and it is the one thing an `Arc` chain gives
+    /// for free. Without this, dropping a `Database` leaks every version it ever
+    /// held.
     fn drop(&mut self) {
         // SAFETY: `&mut self` proves there is no concurrent reader, so the
         // chains can be freed directly rather than deferred. `unprotected` is
@@ -946,7 +942,8 @@ impl<T: Versioned> Table<T> {
 
 /// Configuration for a [`Database`].
 ///
-/// There is no `data_dir`: this engine is in-memory by design, not by omission.
+/// There is no `data_dir`: nothing is ever written to disk — see the
+/// [crate docs](crate#what-this-is-not).
 ///
 /// There is no shard count either: the oracle and the slot map each pick their
 /// own, as compile-time constants, because the oracle's is part of how
@@ -968,7 +965,19 @@ impl Config {
     }
 }
 
-/// The handle everything hangs off.
+/// Owns every table, version chain and index, and hands out [`Transaction`]s.
+///
+/// Every type must be passed to [`Database::register`] before a transaction
+/// touches it; operations on an unregistered type fail with
+/// [`Error::TableNotRegistered`]. Registration is the only setup there is —
+/// nothing is read from disk, and nothing is written to it.
+///
+/// Shared across threads behind an `&`, so an `Arc<Database>` is the usual way
+/// to hand it to several of them. Reads take no locks whatever else is running.
+/// Dropping it frees every version it ever held.
+///
+/// [`Database::compact`] is the exception to all of that: it takes `&mut self`,
+/// so no transaction may be live while it runs.
 pub struct Database {
     oracle: Oracle,
     /// Type-erased tables. **Append-only** — see the safety note on
@@ -1141,11 +1150,19 @@ impl Database {
     /// **It takes `&mut self`, and that is the entire safety argument.** A
     /// [`Transaction`] borrows the database, so an exclusive borrow is a
     /// compile-time proof that none exist — which is what makes it sound to free
-    /// a slot some transaction might otherwise have already resolved. There is
-    /// no runtime check to fail and no window to get wrong.
+    /// a slot some transaction might otherwise have already resolved.
     ///
-    /// Call it during a quiet moment. Nothing else in the engine needs it, and
-    /// nothing on the read or write path pays for its existence.
+    /// **This is deliberately a separate call rather than something the engine
+    /// does for you, and the reason is speed.** Reclaiming slots as it went
+    /// would mean either revalidating every write against the key map or making
+    /// transactions announce themselves to a lock — putting synchronisation back
+    /// onto paths that currently have none. That append-only property is what
+    /// lets a lookup take no locks and write nothing to shared memory, and it is
+    /// worth 1.9x on uniform point reads and **9.8x on contended ones** at four
+    /// threads — the shipped before-and-after, not the throwaway lock-deletion
+    /// experiment `crate::engine::slotmap` tabulates. Confining reclamation to a
+    /// moment when nothing else is running keeps all of it, so call it during a
+    /// quiet one.
     ///
     /// ```
     /// # use mvcc::{Config, Database, Mvcc};

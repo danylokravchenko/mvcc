@@ -2,12 +2,13 @@
 //!
 //! # Why not a sharded `RwLock<HashMap>`
 //!
-//! That is what this replaces, and it was the last shared write on the read
-//! path. A `parking_lot` *read* acquire is still an atomic read-modify-write on
-//! the lock word, so every "lock-free" chain walk was preceded by two RMWs on a
-//! line shared with every other reader of that shard. Sharding 64 ways hides it
-//! when keys are uniform and does nothing at all when they are not: four hot
-//! keys land in at most four shards however many shards exist.
+//! That is the obvious structure for this map, and it puts a shared write back
+//! on the read path. A `parking_lot` *read* acquire is still an atomic
+//! read-modify-write on the lock word, so every "lock-free" chain walk is
+//! preceded by two RMWs on a line shared with every other reader of that shard.
+//! Sharding 64 ways hides it when keys are uniform and does nothing at all when
+//! they are not: four hot keys land in at most four shards however many shards
+//! exist.
 //!
 //! Measured, by deleting the lock as a throwaway experiment and re-running
 //! `cargo bench -- 4`:
@@ -21,11 +22,10 @@
 //! ```
 //!
 //! At one thread the lock costs nothing measurable. All of it is contention —
-//! and the hot-row row was the only workload in the benchmark that went
+//! and under it the hot-row workload is the only one in the benchmark that runs
 //! *backwards* with more threads, 91M at one to 49M at four. This is the same
-//! defect the version chain already had and shed: see `Slot::latest`, where
-//! dropping an `Arc` refcount off the read path was worth 37x on the same
-//! workload.
+//! defect the version chain avoids: see `Slot::latest`, where keeping an `Arc`
+//! refcount off the read path is worth 37x on the same workload.
 //!
 //! # The design
 //!
@@ -165,8 +165,7 @@ struct Shard<T: Versioned> {
     /// Head of the insertion-order list. See [`CHUNK`].
     chunks: Atomic<Chunk<T>>,
     /// Serialises inserts and resizes, and holds the live entry count — which
-    /// is also the next free index in the chunk list. Readers never take it,
-    /// which is the entire point of this module.
+    /// is also the next free index in the chunk list. Readers never take it.
     writers: Mutex<usize>,
 }
 
@@ -370,7 +369,11 @@ impl<T: Versioned> SlotMap<T> {
     /// left. Returns how many were reclaimed.
     ///
     /// This is the one operation that breaks the append-only rule the whole
-    /// module rests on.
+    /// module rests on — and it is confined to exclusive access precisely so
+    /// that the rule holds everywhere else. Removing records concurrently would
+    /// cost a probe-and-revalidate on every write, or a lock every transaction
+    /// has to announce itself to; either gives back the measurement at the top
+    /// of this file, which is the reason the map is shaped this way at all.
     ///
     /// # Safety contract
     ///

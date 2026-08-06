@@ -37,9 +37,9 @@ Things that will be declined, with the reasoning already written down:
 Things that are wanted, roughly in the order they would help:
 
 - **Bugs in isolation behaviour.** A case where a level permits an anomaly it should forbid, or forbids one it should permit, is the most valuable report possible. Ideally as a test in `tests/hermitage.rs` or `tests/isolation_anomalies.rs` that fails.
-- **ART with optimistic lock coupling**, replacing the sharded `HashMap` — the last lock a read takes, and the thing that makes ordered scans cheap
-- **An epoch-based oracle** for the commit timestamp counter. That single shared cache line is the current write-throughput floor. The obvious batched variant cannot work.
-- **YCSB A–C and TPC-C new-order benchmarks.** Nothing in "make it fast" list should start before there is a benchmark to prove it did something.
+- **A measurement of `Slot::readers`.** It is a `Mutex` on the read path at `Serializable`, and the benchmark has no serializable read workload, so nobody knows what it costs. The measurement comes before any fix — the read path's other two locks were both removed for reasons that turned out to be the wrong ones on inspection and the right ones on measurement.
+- **An epoch-based oracle** for the commit timestamp counter. That single shared cache line is the write-throughput floor by elimination, now that no read touches shared memory at all. The obvious batched variant cannot work — see [`DESIGN.md`](DESIGN.md).
+- **YCSB A–C and TPC-C new-order benchmarks.** Nothing on the "make it fast" list should start before there is a benchmark to prove it did something.
 - **Docs and examples.** Examples here are documentation that executes and asserts — see below.
 
 ## Setting up
@@ -77,8 +77,11 @@ Run checks yourself; a PR that fails them is not ready.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
-cargo bench                    # only if you touched the engine
+cargo bench -- 4               # only if you touched the engine
 ```
+
+CI runs all of these on every push and pull request, plus `cargo doc` with
+`-D warnings`, so a broken intra-doc link fails the build.
 
 **Clippy must be at zero warnings.** The lint set in the root `Cargo.toml` is deliberately not `clippy::pedantic` wholesale — on an epoch-based lock-free engine that group is ~150 warnings on code that is that way on purpose, and a lint set nobody can keep at zero stops being a signal. What is enabled is every lint `clippy.toml` sets a threshold for, plus the structural ones the codebase already satisfies.
 
@@ -92,7 +95,7 @@ If a threshold in `clippy.toml` blocks you, the answer is almost always to split
 
 All `unsafe` lives in `src/engine/`, and every block needs a `// SAFETY:` comment that names the invariant keeping it sound — not a restatement of what the code does. The two that carry the most weight:
 
-- **Epoch pinning.** A transaction pins one epoch for its whole life, which is what lets versions be borrowed rather than reference-counted. A borrow thatoutlives its guard is a use-after-free, and it will not reproduce reliably.
+- **Epoch pinning.** A transaction pins one epoch for its whole life, which is what lets versions be borrowed rather than reference-counted. A borrow that outlives its guard is a use-after-free, and it will not reproduce reliably.
 - **The append-only registry.** `Database::table_erased` extends a borrow from a read guard to `&self`, sound only because `register` never removes or replaces an entry. Anything that breaks that has to put the `Arc` back.
 
 Changes to reclamation, the slot CAS protocol, or the watermark handshake need `tests/concurrent_stress.rs` to pass **and** a run under a sanitizer. Those tests cannot prove absence of a use-after-free; they make the window very likely to be hit.
@@ -136,7 +139,7 @@ An optimisation PR with no measurement will be asked for one before review.
 - `rustfmt.toml` and `clippy.toml` are the style guide; don't hand-format around them.
 - **Comments explain why, not what.** The existing ones say what a design choice is protecting or what alternative was tried and rejected. Match that density — it is higher than usual, deliberately, because reasoning about lock-free code from the code alone is not realistic.
 - Public items get doc comments with a runnable example where the API is not obvious from its signature. Doc examples are compiled by `cargo test`.
-- When a change invalidates something in `DESIGN.md`, update `DESIGN.md` in the same commit. It is a record of decisions, and a stale one is worse than none.
+- When a change invalidates something in `DESIGN.md`, update `DESIGN.md` in the same commit. It records the decisions behind the engine, so a reader relies on it being current.
 
 ## Sending the change
 

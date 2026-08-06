@@ -30,7 +30,7 @@ db.transaction(|tx| {
 | **I**solation | ✔ | four levels, verified anomaly by anomaly against [Hermitage](#verified-not-asserted) |
 | **D**urability | ✘ | nothing is written to disk, ever |
 
-**The missing letter is the one to decide on first.** Everything lives in memory and nothing survives the process — no WAL, no recovery, no `data_dir`. See [Scope](#scope) before going further.
+Everything lives in memory and nothing survives the process — no WAL, no recovery, no `data_dir`. Decide whether that is acceptable before going further: see [Scope](#scope).
 
 ---
 
@@ -49,8 +49,6 @@ db.transaction(|tx| {
 ## Scope
 
 This is a database's **concurrency control** without a database's **storage layer** — atomicity, consistency and isolation, but no durability. Transactions, isolation levels, version chains, conflict detection are part of the project. The project doesn't come with WAL, checkpoints, `data_dir`, nor recovery.
-
-Which is a deliberate trade rather than an unfinished one: durability is what forces `fsync` onto the commit path, and dropping it is why a commit here costs a few atomic operations instead of a disk round-trip. What you lose is everything, on process exit.
 
 ## When to use it
 
@@ -234,7 +232,7 @@ tx.delete::<Account>(&2)?;                         // Ok(false) if absent
 
 ### Handling conflicts and retries
 
-Under MVCC, a conflict is not an error condition — it is the normal way the engine tells you two transactions could not both happen. Code that treats it as a failure will be wrong about half the time.
+Under MVCC, a conflict is not an error condition — it is the normal way the engine tells you two transactions could not both happen. The right response is to re-run, not to report a failure.
 
 **The default is that you do not handle it.** `db.transaction` runs the closure, commits, and reruns it from the top if it hit a retriable conflict:
 
@@ -405,7 +403,7 @@ See [`crates/mvcc/tests/hermitage.rs`](crates/mvcc/tests/hermitage.rs).
 | `scan_where`, 1% of 10k rows | 17.0k | 60.6k | |
 | `scan_where`, all of 10k rows | 6.2k | 22.8k | |
 
-**Reads scale, including contended ones.** Nothing on the read path writes to shared memory — not a lock word, not a refcount — so four cores reading the same four rows do not fight over a cache line. That took removing two things: the `Arc` refcount on the version chain, and the sharded `RwLock` in front of it, whose *read* acquire was still an atomic read-modify-write. The hot-row row used to run *backwards*, 91M at one thread to 49M at four.
+**Reads scale, including contended ones.** Nothing on the read path writes to shared memory — not a lock word, not a refcount — so four cores reading the same four rows do not fight over a cache line. Both of those cost more than their size suggests: a refcount dirties a line every other reader of that record needs, and a `parking_lot` *read* acquire is an atomic read-modify-write on the lock word. Either one turns the hot-row workload negative, running slower at four threads than at one.
 
 **Writes are roughly flat.** The commit timestamp counter is a single shared cache line and is the current floor.
 
@@ -432,10 +430,10 @@ built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is
 Not implemented, in rough order of how much they would change things:
 
 - **Online slot reclamation.** `db.compact()` frees the per-key slots of deleted
-  records, but it needs `&mut self` — no transaction may be running. Doing it
-  concurrently would mean either revalidating every write against the map or
-  draining transactions behind a flag, and both put cost on paths that currently
-  have none. See [The failure mode to know about](#the-failure-mode-to-know-about).
+  records, but it needs `&mut self` — no transaction may be running. Deliberate:
+  doing it concurrently costs a revalidation on every write or a lock on every
+  transaction, and the lock-free lookup that buys is worth 9.8× on contended
+  reads. See [The failure mode to know about](#the-failure-mode-to-know-about).
 - **Durability.** No log, no recovery. See [Scope](#scope).
 - **Larger-than-memory.** The dataset must fit in RAM.
 - **A distributed anything.** One process, one machine.

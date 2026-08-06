@@ -878,8 +878,9 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
     ///
     /// The index is the associated const the derive emitted for the field —
     /// `#[mvcc(index)] owner: u64` gives `Item::OWNER` — so a wrong name does
-    /// not compile, and neither does a range of the wrong type. Both used to be
-    /// runtime outcomes: a bad name an error, a mistyped range an empty result.
+    /// not compile, and neither does a range of the wrong type. Naming an index
+    /// by string would make both runtime outcomes instead: a bad name an error,
+    /// a mistyped range an empty result.
     ///
     /// ```rust
     /// use mvcc::{Config, Database, Mvcc};
