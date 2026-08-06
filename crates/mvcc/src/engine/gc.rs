@@ -19,52 +19,65 @@
 //! what MVCC exists to avoid. Reference counting loses to EBR here for the same
 //! reason the timestamp oracle avoids a shared counter.
 //!
-//! # Implementation status: chains are not pruned
+//! # How chains are pruned
 //!
-//! The above describes the mechanism the watermark exists for. **It is not
-//! wired up.** Nothing in the engine walks a version chain and frees the
-//! versions below the watermark:
+//! [`Slot::prune`](crate::engine::store::Slot::prune) does the reclaiming, and
+//! it runs on the **write path** — inside `SlotWrite::commit`, while that
+//! writer still holds the slot lock. That placement is the whole design:
 //!
-//! - `Version::prev` is written once, when the version is constructed, and is
-//!   only ever loaded afterwards. No code truncates a chain.
-//! - The one place a version is freed is `SlotWrite::abort`, which unlinks a
-//!   version whose transaction never committed. Epoch reclamation otherwise
-//!   covers `SlotMap`'s superseded bucket arrays, not versions.
-//! - [`Oracle::gc_watermark`](crate::engine::oracle::Oracle::gc_watermark) has
-//!   two consumers, and neither frees anything: expiring SIREAD locks in
-//!   `crate::engine::ssi`, and [`GcStats`].
+//! - The lock is already held, so no other writer can be mutating the chain and
+//!   pruning needs no synchronisation of its own.
+//! - The write that just lengthened the chain is what pays to shorten it, so
+//!   cost lands on the workload creating the garbage.
+//! - No background thread, and no sweep to find which slots are worth visiting.
 //!
-//! So a committed version stays reachable from its chain for the lifetime of
-//! the process. Memory grows with the total number of writes rather than with
-//! the amount of live data — a record updated a million times holds a million
-//! versions. Reads do not degrade with it, because the newest version is at the
-//! head of the chain.
+//! Dead versions are always a *suffix*. `SlotWrite::commit` stamps a displaced
+//! version's `end` with its successor's `begin`, so `end` decreases walking
+//! down a chain, which makes `end <= watermark` downward-closed. Pruning is
+//! therefore a tail truncation: null one `prev` and the whole dead suffix
+//! detaches at once. No interior node is ever unlinked, so a reader mid-walk
+//! never has the chain rearranged underneath it.
 //!
-//! # The failure mode this becomes
+//! What this does **not** reclaim: the `Slot` itself, and the tombstone left by
+//! a delete. Slots are immortal on purpose — it is what lets `SlotMap::get`
+//! hand out a `&Slot<T>` borrowed from the map with no reclamation argument at
+//! all. A workload that inserts and deletes many *distinct* keys still grows.
 //!
-//! Once a reclaimer exists it will be gated on the watermark, which is a
-//! *minimum* over live snapshots. One forgotten transaction — a REPL session, a
-//! leaked handle, an analytics query — will pin it and stop reclamation for
-//! everyone. That is the most common way a real MVCC system falls over, and it
-//! presents as a memory leak rather than as a transaction problem.
+//! # The watermark is a hint
 //!
-//! [`GcStats::active_transactions`] and [`GcStats::watermark`] are already
-//! reported, so the instrumentation is in place ahead of the mechanism: a
+//! Pruning reads [`Database::gc_hint`](crate::engine::store::Database::gc_hint)
+//! rather than calling [`Oracle::gc_watermark`](crate::engine::oracle::Oracle::gc_watermark),
+//! which takes all sixteen shard locks and is far too expensive per commit. The
+//! hint is recomputed every `Database::GC_HINT_INTERVAL` commits.
+//!
+//! Staleness is safe in exactly one direction and this errs in it: the true
+//! watermark never moves backwards, so a stale hint is always a lower bound —
+//! it prunes less than it could, never more.
+//!
+//! # The failure mode to instrument
+//!
+//! Reclamation is bounded below by the oldest live snapshot, because the
+//! watermark is a *minimum* over them. One forgotten transaction — a REPL
+//! session, a leaked handle, an analytics query — pins it, and from that moment
+//! version chains grow without limit again. That is the most common way a real
+//! MVCC system falls over, and it presents as a memory leak rather than as a
+//! transaction problem.
+//!
+//! Watch [`GcStats::active_transactions`] and [`GcStats::watermark`]: a
 //! watermark that stops advancing while writes continue is the signal.
 
 use crate::core::Timestamp;
 
 /// A snapshot of reclamation state, from [`Database::stats`].
 ///
-/// These report the state a reclaimer *would* be gated on. As the module docs
-/// explain, version chains are not pruned yet, so a stalled watermark is not
-/// what makes memory grow today — it grows with cumulative writes regardless.
+/// These two are what version reclamation is gated on, which is why they are
+/// the pair to alert on. Pruning cannot pass the oldest live snapshot, so a
+/// single forgotten transaction stops it for every record at once and chains
+/// start growing without limit again.
 ///
-/// [`watermark`] and [`active_transactions`] are still the pair to watch: they
-/// are what will matter the moment reclamation lands, and a transaction count
-/// that only climbs is a leaked handle in its own right. The signal is a flat
-/// watermark while writes continue. Neither number means much alone — a flat
-/// watermark on an idle database is just an idle database.
+/// The signal is [`watermark`] flat while writes continue, usually alongside an
+/// [`active_transactions`] that only climbs. Neither number means much alone —
+/// a flat watermark on an idle database is just an idle database.
 ///
 /// ```rust
 /// # use mvcc::{Config, Database, Mvcc};
@@ -91,8 +104,8 @@ use crate::core::Timestamp;
 #[derive(Clone, Copy, Debug)]
 pub struct GcStats {
     /// The oldest snapshot any live transaction still reads at, or the read
-    /// watermark when there are none. Nothing is gated on it yet — see the
-    /// module docs — but it is what a reclaimer would advance behind.
+    /// watermark when there are none. Versions superseded at or before this are
+    /// reclaimable, so if it stops advancing, nothing else matters.
     pub watermark: Timestamp,
     /// Live transactions. A number that only grows is the leak.
     pub active_transactions: usize,

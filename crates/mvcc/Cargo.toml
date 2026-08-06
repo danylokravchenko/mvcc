@@ -26,6 +26,13 @@ parking_lot = "0.12.5"
 name = "throughput"
 harness = false
 
+# Also `harness = false`, and for the same reason: this measures ns/commit as a
+# version chain grows, which is a shape libtest and criterion have no way to
+# express. See the file's docs.
+[[bench]]
+name = "reclamation"
+harness = false
+
 [lints]
 workspace = true
 

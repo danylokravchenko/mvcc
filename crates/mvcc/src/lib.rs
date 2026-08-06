@@ -166,27 +166,23 @@
 //!
 //! # Memory growth
 //!
-//! **Superseded versions are never reclaimed.** A version is freed only if the
-//! transaction that wrote it aborted; once a write commits, the version it
-//! displaced stays in that record's chain for the lifetime of the process.
-//! Memory therefore grows with the *total number of writes*, not with the amount
-//! of live data — a record updated a million times holds a million versions.
+//! Superseded versions are reclaimed. When a write commits it also prunes the
+//! record's chain, freeing every version no live transaction can still reach,
+//! so steady-state memory tracks live data rather than cumulative writes.
 //!
-//! Budget for it accordingly: this suits workloads whose write volume is bounded
-//! by something, and a long-running writer will need the process recycled.
-//! Read performance does not degrade with chain length, because the newest
-//! version sits at the head of the chain and that is what a current-snapshot
-//! read finds first.
+//! **Reclamation is bounded below by the oldest live transaction.** The cutoff
+//! is a *minimum* over live snapshots, so one forgotten transaction — a REPL
+//! session, a leaked handle, a long-running scan — pins it and version chains
+//! grow without limit for as long as it is open. It presents as a memory leak
+//! rather than as a transaction problem, and it is the most common way real
+//! MVCC systems fall over. [`Database::stats`] exposes the watermark and the
+//! live transaction count; watch them, and see [`stats::GcStats`].
 //!
-//! [`Database::stats`] reports the GC watermark and the live transaction count.
-//! Nothing frees versions based on them today — they are what a reclaimer would
-//! be gated on. When one exists the watermark will be a *minimum* over live
-//! snapshots, so a single forgotten transaction — a REPL session, a leaked
-//! handle, a long-running scan — will pin it and stall reclamation for
-//! everyone. That is the shape this will fail in, and it is the most common way
-//! real MVCC systems fall over: it presents as a memory leak rather than as a
-//! transaction problem. Watching those two numbers now costs nothing and is the
-//! signal then.
+//! Two things are deliberately *not* reclaimed. A record's slot is immortal
+//! once created, so a workload that inserts and deletes many **distinct** keys
+//! still grows even though its versions are collected. And reads never trigger
+//! pruning, so a record written once and then only read keeps every version it
+//! had at its last write.
 //!
 //! # What this is not
 //!
@@ -214,6 +210,12 @@
 //! [`SerializationFailure`]: Error::SerializationFailure
 
 #![doc(html_no_source)]
+
+// The derive emits absolute `::mvcc::__private` paths, which have no crate to
+// resolve against inside `mvcc` itself. Unit tests here use the derive like any
+// user would, so give the crate its own name to answer them.
+#[cfg(test)]
+extern crate self as mvcc;
 
 // Both modules are private: everything users touch is re-exported below, so the
 // internal layout can change without it being a breaking change.

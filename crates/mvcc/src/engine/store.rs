@@ -273,6 +273,96 @@ impl<T> Slot<T> {
             .lock
             .compare_exchange(txn.0, 0, Ordering::AcqRel, Ordering::Acquire);
     }
+
+    /// Free the versions no live transaction can still reach.
+    ///
+    /// Dead versions are always a *suffix* of the chain, which is what makes
+    /// this a tail truncation rather than a splice: `SlotWrite::commit` stamps a
+    /// displaced version's `end` with its successor's `begin`, so `end`
+    /// decreases monotonically walking down. Find the oldest version still
+    /// needed, null its `prev`, and the whole dead suffix detaches in one store.
+    /// No interior node is ever unlinked, so a reader mid-walk cannot have the
+    /// chain rearranged underneath it.
+    ///
+    /// The caller must hold the slot lock, which is what excludes other
+    /// *writers*. Concurrent **readers** need no exclusion at all: one either
+    /// loads `prev` before the store and walks into versions its own pin keeps
+    /// alive, or loads it after and stops. Neither can want what is freed here,
+    /// because `gc` is a minimum over live snapshots and everything below the
+    /// cut ended at or before it.
+    pub(crate) fn prune(&self, gc: Timestamp, guard: &Guard) {
+        let mut cur = self.latest.load(Ordering::Acquire, guard);
+        for _ in 0..Self::PRUNE_PROBE {
+            // SAFETY: reachable from `latest` during this pin, so still alive —
+            // the same argument as `Slot::read`.
+            let Some(v) = (unsafe { cur.as_ref() }) else {
+                return;
+            };
+            let next = v.prev.load(Ordering::Acquire, guard);
+            let Some(n) = (unsafe { next.as_ref() }) else {
+                return;
+            };
+
+            if !Self::ended_at_or_before(n, gc) {
+                cur = next;
+                continue;
+            }
+
+            v.prev.store(Shared::null(), Ordering::Release);
+
+            // Retire each node individually. `Atomic` does not own its target,
+            // so dropping a version does not drop the chain hanging off it —
+            // freeing only the head of the suffix would leak the rest.
+            let mut doomed = next;
+            while let Some(d) = unsafe { doomed.as_ref() } {
+                let following = d.prev.load(Ordering::Acquire, guard);
+                // SAFETY: unlinked above and unreachable from `latest`, so no
+                // new reader can find it. `defer_destroy` runs the drop only
+                // once every thread pinned at retirement has unpinned, which
+                // covers readers that loaded the pointer before the store.
+                unsafe { guard.defer_destroy(doomed) };
+                doomed = following;
+            }
+            return;
+        }
+    }
+
+    /// How far [`Slot::prune`] looks for the cut point before giving up.
+    ///
+    /// **This bound is what keeps a pinned watermark from becoming quadratic.**
+    /// Searching the whole chain costs O(chain) per commit, and while a
+    /// long-running transaction holds the watermark down there is nothing to
+    /// find — so every commit re-scanned an ever-growing chain to fail. Measured
+    /// on one hot row: 2.3µs per update at 2k updates, 39µs at 32k, against a
+    /// flat 0.3µs unpinned.
+    ///
+    /// A small bound loses nothing, because the cut point is only ever *near
+    /// the head* when there is anything to collect. Refreshing
+    /// [`Database::gc_hint`] jumps the watermark to the present, which puts the
+    /// boundary within a couple of versions; between refreshes the chain grows
+    /// and the probe cheaply fails, then the next refresh collects the whole
+    /// backlog in one cut. What this gives up is pruning a chain whose live
+    /// prefix is genuinely longer than this — which means readers are holding
+    /// it, and the versions could not be freed anyway.
+    const PRUNE_PROBE: usize = 8;
+
+    /// Whether `v` was superseded at or before `gc`, and so is invisible to
+    /// every live and future transaction.
+    ///
+    /// Going through [`Visibility`] rather than comparing the raw field is
+    /// load-bearing. An in-flight `end` is a delete or update still running:
+    /// the version is still current for everyone but its writer and must not be
+    /// freed — and the tag bit would read as an enormous timestamp, making the
+    /// naive comparison answer "long dead" for the one case where it is most
+    /// wrong.
+    fn ended_at_or_before(v: &Version<T>, gc: Timestamp) -> bool {
+        match Visibility::decode(v.end.load(Ordering::Acquire)) {
+            // A reader at `gc` needs `begin <= gc < end`, so `end == gc` is
+            // already invisible to it and to every newer snapshot.
+            Visibility::CommittedAt(ts) => ts <= gc,
+            Visibility::InFlight(_) => false,
+        }
+    }
 }
 
 /// Rows a scan returned: primary key and the version it matched through, in
@@ -726,6 +816,20 @@ pub struct Database {
     /// It is a real scalability limit and the next thing to shard; see the note
     /// in `Transaction::commit`.
     commit_lock: Mutex<()>,
+    /// Cached GC watermark, used by [`Slot::prune`].
+    ///
+    /// A hint, deliberately. [`Oracle::gc_watermark`] takes all sixteen of the
+    /// oracle's shard locks — the cost `Transaction::detect_conflicts` already
+    /// goes out of its way to avoid — so calling it on every commit would cost
+    /// far more than the pruning saves.
+    ///
+    /// Staleness is safe in exactly one direction, and this errs in it. The
+    /// true watermark never moves backwards: it is a minimum over live
+    /// snapshots, and `Oracle::begin_snapshot` hands out the read watermark,
+    /// which only advances. So a stale value is always a *lower* bound — it
+    /// prunes less than it could, never more. `fetch_max` keeps it monotonic so
+    /// a delayed thread cannot publish an older reading over a newer one.
+    gc_hint: AtomicU64,
 }
 
 impl Database {
@@ -756,8 +860,34 @@ impl Database {
             tables: RwLock::new(HashMap::new()),
             next_table_id: AtomicU16::new(0),
             commit_lock: Mutex::new(()),
+            gc_hint: AtomicU64::new(0),
         })
     }
+
+    /// The cached GC watermark for pruning. See the field.
+    pub(crate) fn gc_hint(&self) -> Timestamp {
+        Timestamp(self.gc_hint.load(Ordering::Relaxed))
+    }
+
+    /// Recompute the pruning watermark, every [`Self::GC_HINT_INTERVAL`]
+    /// commits.
+    ///
+    /// Commit timestamps are gap-free — the completion ring depends on it — so
+    /// testing the timestamp itself samples at a fixed global rate without
+    /// another shared counter to contend on.
+    pub(crate) fn refresh_gc_hint(&self, ts: Timestamp) {
+        if ts.raw().is_multiple_of(Self::GC_HINT_INTERVAL) {
+            let watermark = self.oracle.gc_watermark();
+            self.gc_hint.fetch_max(watermark.raw(), Ordering::Relaxed);
+        }
+    }
+
+    /// How often to recompute [`Database::gc_hint`], in commits.
+    ///
+    /// The trade is bounded lag against sixteen shard locks. At this rate the
+    /// chains carry at most this many extra versions per record between
+    /// refreshes, which is negligible next to the unbounded growth it replaces.
+    pub(crate) const GC_HINT_INTERVAL: u64 = 128;
 
     /// The timestamp oracle.
     ///
@@ -950,5 +1080,117 @@ impl Database {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Mvcc;
+
+    #[derive(Mvcc, Clone, Debug)]
+    struct Counter {
+        #[mvcc(primary_key)]
+        id: u64,
+        hits: u64,
+    }
+
+    /// Versions reachable from a slot's chain head.
+    fn chain_len(db: &Database, key: u64) -> usize {
+        let guard = crossbeam_epoch::pin();
+        let table = db
+            .table_erased(TypeId::of::<Counter>(), Counter::TABLE_NAME)
+            .unwrap()
+            .downcast_ref::<Table<Counter>>()
+            .unwrap();
+        let slot = table.slot(&key, &guard).expect("slot exists");
+
+        let mut n = 0;
+        let mut cur = slot.latest.load(Ordering::Acquire, &guard);
+        // SAFETY: reachable from `latest` under this pin.
+        while let Some(v) = unsafe { cur.as_ref() } {
+            n += 1;
+            cur = v.prev.load(Ordering::Acquire, &guard);
+        }
+        n
+    }
+
+    fn bump(db: &Database, times: u64) {
+        for _ in 0..times {
+            db.transaction(|tx| tx.update::<Counter>(&1, |c| c.hits += 1))
+                .unwrap();
+        }
+    }
+
+    fn open() -> Database {
+        let db = Database::open(Config::in_memory()).unwrap();
+        db.register::<Counter>().unwrap();
+        db.transaction(|tx| tx.insert(Counter { id: 1, hits: 0 }))
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn repeated_updates_do_not_grow_the_chain_without_bound() {
+        let db = open();
+        // Several refresh intervals, so the hint advances more than once.
+        let updates = Database::GC_HINT_INTERVAL * 8;
+        bump(&db, updates);
+
+        let len = chain_len(&db, 1) as u64;
+        assert!(
+            len < updates / 4,
+            "chain was {len} after {updates} updates: pruning is not keeping up"
+        );
+    }
+
+    #[test]
+    fn an_open_transaction_pins_the_versions_it_can_still_see() {
+        let db = open();
+        bump(&db, Database::GC_HINT_INTERVAL * 4);
+
+        // A reader that began here must keep seeing its own snapshot, so
+        // everything written from now on has to stay reachable.
+        let mut reader = db.begin();
+        let seen = reader.get::<Counter>(&1).unwrap().unwrap().hits;
+
+        let held = Database::GC_HINT_INTERVAL * 4;
+        bump(&db, held);
+        let pinned = chain_len(&db, 1) as u64;
+
+        assert_eq!(
+            reader.get::<Counter>(&1).unwrap().unwrap().hits,
+            seen,
+            "the snapshot moved under a live transaction"
+        );
+        assert!(
+            pinned >= held,
+            "chain was {pinned} with a reader pinning {held} versions"
+        );
+
+        // Once it is gone the watermark can pass them, and the next commits
+        // that refresh the hint collect them.
+        drop(reader);
+        bump(&db, Database::GC_HINT_INTERVAL * 4);
+        let after = chain_len(&db, 1) as u64;
+        assert!(
+            after < pinned,
+            "chain stayed at {after} after the reader was dropped (was {pinned})"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_survives_pruning() {
+        let db = open();
+        bump(&db, Database::GC_HINT_INTERVAL * 2);
+        db.transaction(|tx| tx.delete::<Counter>(&1)).unwrap();
+        db.transaction(|tx| tx.insert(Counter { id: 1, hits: 0 }))
+            .unwrap();
+        bump(&db, Database::GC_HINT_INTERVAL * 4);
+
+        // The record is live again, and readable — pruning must not have cut
+        // the chain above the version that carries it.
+        let mut tx = db.begin();
+        assert!(tx.get::<Counter>(&1).unwrap().is_some());
     }
 }

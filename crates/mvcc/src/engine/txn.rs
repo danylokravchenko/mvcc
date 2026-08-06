@@ -20,8 +20,9 @@ use crate::engine::store::{Claim, Database, Slot, Table, Version};
 ///
 /// Type-erased so one `Transaction` can hold writes to many different tables.
 trait WriteOp<'db> {
-    /// Stamp the new version visible at `ts` and retire the one it replaced.
-    fn commit(&self, ts: Timestamp);
+    /// Stamp the new version visible at `ts`, retire the one it replaced, and
+    /// drop any versions now below `gc`.
+    fn commit(&self, ts: Timestamp, gc: Timestamp, guard: &Guard);
     /// Unlink the new version, restoring the slot to what it was.
     fn abort(&self);
     /// Transactions that read what this write overwrites — the incoming half of
@@ -50,7 +51,7 @@ struct SlotWrite<'db, T: Versioned> {
 }
 
 impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
-    fn commit(&self, ts: Timestamp) {
+    fn commit(&self, ts: Timestamp, gc: Timestamp, guard: &Guard) {
         // SAFETY: both pointers name versions kept alive by this transaction's
         // pin — see the note on the fields.
         unsafe {
@@ -62,6 +63,11 @@ impl<'db, T: Versioned> WriteOp<'db> for SlotWrite<'db, T> {
             }
             (*self.installed).begin.store(ts.raw(), Ordering::Release);
         }
+        // Prune while the lock is still ours. This is the one moment the chain
+        // is exclusively held, and the write that just lengthened it is the
+        // natural place to pay for shortening it — no background thread, and no
+        // second pass to find the slots worth visiting.
+        self.slot.prune(gc, guard);
         self.slot.unlock(self.txn);
     }
 
@@ -1119,11 +1125,15 @@ impl<'db, I: IsolationLevel> Transaction<'db, I> {
                 return Err(Error::SerializationFailure);
             }
 
+            // Read before stamping: pruning must not consider the version this
+            // commit is about to displace, and `gc` is necessarily below `ts`.
+            let gc = self.db.gc_hint();
             let ts = self.db.oracle().begin_commit();
             for write in &self.writes {
-                write.commit(ts);
+                write.commit(ts, gc, &self.guard);
             }
             self.db.oracle().publish(ts);
+            self.db.refresh_gc_hint(ts);
             if let Some(state) = &self.state {
                 state.mark_committed(ts);
             }
