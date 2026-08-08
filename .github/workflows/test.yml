@@ -53,7 +53,7 @@ jobs:
           for file in crates/mvcc-core/examples/*.rs; do
             name=$(basename "$file" .rs)
             echo "::group::cargo run --example $name"
-            if ! cargo run -p mvcc --all-features --example "$name"; then
+            if ! cargo run -p mvcc-core --all-features --example "$name"; then
               echo "::error file=$file::example '$name' failed"
               failed=1
             fi
