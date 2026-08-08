@@ -41,7 +41,7 @@ The examples are the fastest way in, and each one ends by asserting the world it
 - [Scope](#scope) — what this is and is not
 - [When to use it](#when-to-use-it)
 - [How MVCC works here](#how-mvcc-works-here)
-- [Using it](#using-it)
+- [Using it](#using-it) — installing, and the API
 - [Isolation levels](#isolation-levels) — and how to choose
 - [Performance](#performance)
 - [Status](#status)
@@ -134,6 +134,17 @@ What is *not* reclaimed is the per-key slot: roughly **180 bytes per distinct ke
 `db.compact()` reclaims them — measured, 180 bytes per key down to 2. Call it during a quiet moment if your key space is unbounded.
 
 ## Using it
+
+### Installing
+
+```toml
+[dependencies]
+mvcc-core = "0.1"
+```
+
+The package is `mvcc-core`, the library it builds is `mvcc`, so imports say `mvcc::` — `mvcc` was taken on crates.io in 2018 by an unrelated crate.
+
+`#[derive(Mvcc)]` sits behind the `derive` feature, which is on by default. Turning it off with `default-features = false` leaves you implementing [`Versioned`](https://docs.rs/mvcc-core/latest/mvcc/trait.Versioned.html) by hand, which is only worth doing for a layout the derive cannot express.
 
 ### Defining a record
 
