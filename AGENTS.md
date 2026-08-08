@@ -28,7 +28,7 @@ this whole section exists to prevent.
 ## Layout
 
 ```text
-crates/mvcc/          the library
+crates/mvcc-core/     the library
 ├── src/core/         timestamps, visibility, isolation typestates, Versioned
 │                     — #![forbid(unsafe_code)] at the module level
 ├── src/engine/       version chains, transactions, oracle, indexes, GC — all unsafe lives here
