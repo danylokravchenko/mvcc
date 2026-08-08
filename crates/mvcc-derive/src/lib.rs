@@ -1,13 +1,13 @@
 //! The proc-macro behind `#[derive(Mvcc)]`, which turns a plain struct into a
 //! table the `mvcc` engine can store.
 //!
-//! **Do not depend on this crate directly.** Depend on `mvcc`, which re-exports
+//! **Do not depend on this crate directly.** Depend on `mvcc-core`, which re-exports
 //! the derive and is the only thing the generated code refers to. The
 //! user-facing documentation — what the attributes mean, what you get — lives on
 //! that re-export, so that it renders at `mvcc::Mvcc` where people arrive, and
 //! so that its examples are real doctests. They could not live here: a compiling
 //! example needs the `Versioned` trait this macro implements, and depending on
-//! `mvcc` to get it, even as a dev-dependency, is a cycle. This page is for
+//! `mvcc-core` to get it, even as a dev-dependency, is a cycle. This page is for
 //! reading or changing the expansion.
 //!
 //! # What it generates

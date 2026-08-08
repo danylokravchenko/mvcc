@@ -45,7 +45,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mvcc"
+name = "mvcc-core"
 version = "0.1.0"
 dependencies = [
  "crossbeam-epoch",

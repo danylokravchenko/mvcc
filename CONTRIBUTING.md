@@ -55,7 +55,7 @@ cargo test --workspace
 The workspace is two crates, and the split is not negotiable — a proc-macro crate can export nothing but macros:
 
 ```text
-crates/mvcc/          the library
+crates/mvcc-core/     the library
 ├── src/core/         timestamps, visibility, isolation typestates, Versioned
 │                     — #![forbid(unsafe_code)]
 ├── src/engine/       version chains, transactions, oracle, indexes, GC

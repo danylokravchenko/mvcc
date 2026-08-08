@@ -1,6 +1,13 @@
 # MVCC
 
-**ACI, hold the D.** Three quarters of a database, for ordinary Rust structs. Add `#[derive(Mvcc)]` and get atomic transactions, enforced constraints, and four isolation levels including a serializable one that actually is.
+Add `#[derive(Mvcc)]` and get atomic transactions, enforced constraints, and four isolation levels for ordinary Rust structs.
+
+| | | |
+| --- | --- | --- |
+| **A**tomicity | ✔ | a transaction commits whole or not at all; a dropped one rolls back |
+| **C**onsistency | ✔ | primary keys and unique indexes are enforced against the committed database, and `Serializable` preserves any invariant your code checks |
+| **I**solation | ✔ | four levels, verified anomalies against [Hermitage](#isolation-verification) |
+| **D**urability | ✘ | nothing is written to disk, ever |
 
 ```rust
 #[derive(Mvcc, Clone, Debug)]
@@ -23,14 +30,9 @@ db.transaction(|tx| {
 })?;
 ```
 
-| | | |
-| --- | --- | --- |
-| **A**tomicity | ✔ | a transaction commits whole or not at all; a dropped one rolls back |
-| **C**onsistency | ✔ | primary keys and unique indexes are enforced against the committed database, and `Serializable` preserves any invariant your code checks |
-| **I**solation | ✔ | four levels, verified anomaly by anomaly against [Hermitage](#verified-not-asserted) |
-| **D**urability | ✘ | nothing is written to disk, ever |
-
 Everything lives in memory and nothing survives the process — no WAL, no recovery, no `data_dir`. Decide whether that is acceptable before going further: see [Scope](#scope).
+
+The examples are the fastest way in, and each one ends by asserting the world it built is still consistent. [`examples/game.rs`](crates/mvcc-core/examples/game.rs) is the end-to-end tour: two heroes reaching for the same sword (write conflict), a hero overloading herself (write skew, and the fix), a party filling up (a phantom), an atomic trade, a long report reading while the world moves, and a four-thread raid.
 
 ---
 
@@ -57,6 +59,7 @@ Reach for this when you have **shared mutable state that several threads read an
 Good fits:
 
 - An in-process store where readers must never block writers — config state, session tables, routing tables, a simulation's world state, an order book.
+- Synchronization actions across multiple resources: take an element from one struct, and update the usage in another one. If "stop the world behaviour" is not acceptable, use MVCC.
 - Anywhere you are reaching for `RwLock<HashMap<K, V>>` and finding that a consistent view across *two* maps is impossible without a global lock.
 - Enforcing invariants across records ("at least one doctor on call", "balance never negative") where you want the engine to catch the race rather than hand-rolling the locking.
 - Long analytical reads over data that is being written concurrently. A reader sees a stable snapshot and never blocks a writer, however long it runs.
@@ -71,7 +74,7 @@ Use something else when:
 | one map, one thread at a time | `RwLock<HashMap<K, V>>` — genuinely |
 | queries by shape rather than by key | a query engine; this has no planner |
 
-The honest comparison is not against Postgres, it is against `RwLock<HashMap<_, _>>`. This wins when *consistency across records* matters or when readers must not be blocked. If neither is true, the lock is simpler and you should use it.
+The honest comparison is not against a real DBMS, it is against `RwLock<HashMap<_, _>>`. This wins when *consistency across records* matters or when readers must not be blocked. If neither is true, the lock is simpler and you should use it.
 
 ## How MVCC works here
 
@@ -124,7 +127,7 @@ A delete installs a *tombstone* version rather than removing anything, so a read
 
 Superseded versions are reclaimed. A write prunes the record's chain as it commits, and a sweep riding on other commits collects records that are no longer written, so steady-state memory tracks live data rather than cumulative writes. Deleting a record eventually returns everything it held, once its tombstone falls below the watermark.
 
-Reclamation is bounded below by the oldest live snapshot. **One forgotten transaction — a REPL session, a leaked handle, a long-running scan — pins that watermark and version chains grow without limit.** It presents as a memory leak rather than as a transaction problem, and it is the most common way real MVCC systems fall over. `db.stats()` exposes the watermark and the live transaction count; watch them.
+Reclamation is bounded below by the oldest live snapshot. **One forgotten transaction — a REPL session, a leaked handle, a long-running scan — pins that watermark and version chains grow without limit.** `db.stats()` exposes the watermark and the live transaction count; watch them.
 
 What is *not* reclaimed is the per-key slot: roughly **180 bytes per distinct key** the database has ever held, measured with a counting allocator over 50,000 insert-then-delete keys. That cost is flat in the size of your record — everything that scales with it lives in the version, which is freed — so churning through unboundedly many distinct keys still grows, at a fixed cost per key rather than per byte written.
 
@@ -183,7 +186,7 @@ db.transaction(|tx| {
 
 Because the closure may run more than once, it must not have side effects outside the transaction.
 
-For manual control, `db.begin()` returns a transaction you commit or drop. **Dropping without committing rolls back** — silently committing would be far worse.
+For manual control, `db.begin()` returns a transaction you commit or drop. **Dropping without committing rolls back**.
 
 ```rust
 let mut tx = db.begin();
@@ -245,7 +248,7 @@ db.transaction(|tx| {
 })?;
 ```
 
-Up to 100 attempts, with exponential backoff capped at about a millisecond — so roughly 90ms of retrying before it gives up and returns the last error. The backoff is not decoration: without it two conflicting transactions retry in lockstep and collide at the same point every time.
+Up to 100 attempts, with exponential backoff capped at about a millisecond — so roughly 90ms of retrying before it gives up and returns the last error. Without the backoff two conflicting transactions retry in lockstep and collide at the same point every time.
 
 #### Which errors retry
 
@@ -381,13 +384,13 @@ Balance checks, capacity limits, "at least one of these must remain true", uniqu
 
 **`ReadCommitted` is rarely what you want.** It exists for read-mostly work where seeing the freshest committed value matters more than seeing a consistent one.
 
-### Verified, not asserted
+### Isolation Verification
 
-Isolation behaviour is checked against [Hermitage](https://github.com/ept/hermitage), Martin Kleppmann's isolation verification suite: all ten anomalies (G0, G1a/b/c, OTV, PMP, P4, G-single, G2-item, G2), each asserted **present or absent per level**, with the original SQL transcript quoted alongside the port. A level that forbids too much is as wrong as one that forbids too little, so both directions are tested.
+Isolation behaviour is checked against [Hermitage](https://github.com/ept/hermitage), Martin Kleppmann's isolation verification suite: all ten anomalies (G0, G1a/b/c, OTV, PMP, P4, G-single, G2-item, G2), each asserted **present or absent per level**, with the original SQL transcript quoted alongside the port.
 
 Results match PostgreSQL, with one deliberate difference: **lost update (P4) is prevented even at `ReadCommitted`**, because this engine aborts rather than blocking on a locked row, which makes it stronger than SQL read committed there.
 
-See [`crates/mvcc/tests/hermitage.rs`](crates/mvcc/tests/hermitage.rs).
+See [`crates/mvcc-core/tests/hermitage.rs`](crates/mvcc-core/tests/hermitage.rs).
 
 ## Performance
 
@@ -403,20 +406,15 @@ See [`crates/mvcc/tests/hermitage.rs`](crates/mvcc/tests/hermitage.rs).
 | `scan_where`, 1% of 10k rows | 17.0k | 60.6k | |
 | `scan_where`, all of 10k rows | 6.2k | 22.8k | |
 
-**Reads scale, including contended ones.** Nothing on the read path writes to shared memory — not a lock word, not a refcount — so four cores reading the same four rows do not fight over a cache line. Both of those cost more than their size suggests: a refcount dirties a line every other reader of that record needs, and a `parking_lot` *read* acquire is an atomic read-modify-write on the lock word. Either one turns the hot-row workload negative, running slower at four threads than at one.
+**Reads scale, including contended ones.** Nothing on the read path writes to shared memory — not a lock word, not a refcount — so four cores reading the same four rows do not fight over a cache line. A refcount dirties a line every other reader of that record needs, and a `parking_lot` *read* acquire is an atomic read-modify-write on the lock word. Either one turns the hot-row workload negative, running slower at four threads than at one.
 
 **Writes are roughly flat.** The commit timestamp counter is a single shared cache line and is the current floor.
 
 Three things worth knowing when reading any number here:
 
-- **Always state the thread count.** These workloads behave very differently at
-  one thread and at four, and contended figures are the honest ones to quote.
-- **Hot rows are the realistic case.** Uniformly random keys leave per-record
-  synchronization uncontended and therefore invisible; the benchmark includes a
-  four-hot-row workload specifically because that is where design choices show.
-- **Scans are per-scan, not per-row**, over a 10,000-row table — so the 1% row
-  is roughly 600M rows/sec visited at four threads. An unselective scan is
-  dominated by sorting its result, not by reading it.
+- **Always state the thread count.** These workloads behave very differently at one thread and at four, and contended figures are the honest ones to quote.
+- **Hot rows are the realistic case.** Uniformly random keys leave per-record synchronization uncontended and therefore invisible; the benchmark includes a four-hot-row workload specifically because that is where design choices show.
+- **Scans are per-scan, not per-row**, over a 10,000-row table — so the 1% row is roughly 600M rows/sec visited at four threads. An unselective scan is dominated by sorting its result, not by reading it.
 
 `benches/throughput.rs` separates workloads by which shared structure they touch, so a result points at a cause rather than just a number.
 
@@ -424,16 +422,9 @@ Three things worth knowing when reading any number here:
 
 Working and tested: version chains, all four isolation levels, SSI, secondary indexes with unique constraints, ordered range scans over them, predicate reads, epoch-based reclamation with on-commit chain pruning, a lock-free primary key map.
 
-The examples are the fastest way in, and each one ends by asserting the world it
-built is still consistent. [`examples/game.rs`](crates/mvcc/examples/game.rs) is the end-to-end tour: two heroes reaching for the same sword (write conflict), a hero overloading herself (write skew, and the fix), a party filling up (a phantom), an atomic trade, a long report reading while the world moves, and a four-thread raid.
-
 Not implemented, in rough order of how much they would change things:
 
-- **Online slot reclamation.** `db.compact()` frees the per-key slots of deleted
-  records, but it needs `&mut self` — no transaction may be running. Deliberate:
-  doing it concurrently costs a revalidation on every write or a lock on every
-  transaction, and the lock-free lookup that buys is worth 9.8× on contended
-  reads. See [The failure mode to know about](#the-failure-mode-to-know-about).
+- **Online slot reclamation.** `db.compact()` frees the per-key slots of deleted records, but it needs `&mut self` — no transaction may be running. Deliberate: doing it concurrently costs a revalidation on every write or a lock on every transaction, and the lock-free lookup that buys is worth 9.8× on contended reads. See [The failure mode to know about](#the-failure-mode-to-know-about).
 - **Durability.** No log, no recovery. See [Scope](#scope).
 - **Larger-than-memory.** The dataset must fit in RAM.
 - **A distributed anything.** One process, one machine.

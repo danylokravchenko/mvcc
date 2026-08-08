@@ -1,5 +1,5 @@
 [package]
-name = "mvcc"
+name = "mvcc-core"
 description = "Multi-version concurrency control for ordinary Rust structs. Add #[derive(Mvcc)] and get snapshot-isolated transactions with pluggable isolation levels."
 version.workspace = true
 edition.workspace = true
@@ -10,6 +10,11 @@ authors.workspace = true
 readme = "README.md"
 keywords = ["mvcc", "database", "transactions", "concurrency", "isolation"]
 categories = ["database-implementations", "concurrency"]
+
+# The package is `mvcc-core` because `mvcc` was taken on crates.io in 2018 by an
+# unrelated, abandoned 0.0.1.
+[lib]
+name = "mvcc"
 
 [features]
 default = ["derive"]

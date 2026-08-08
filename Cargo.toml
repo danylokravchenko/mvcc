@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mvcc", "crates/mvcc-derive"]
+members = ["crates/mvcc-core", "crates/mvcc-derive"]
 
 [workspace.package]
 version = "0.1.0"
